@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Optional
+from typing import Optional, Union
 
 try:  # pragma: no cover - exercised only when discord.py is unavailable.
     import discord  # type: ignore
@@ -15,8 +15,9 @@ except ModuleNotFoundError:  # pragma: no cover - fallback used only in CI witho
             async def send(self, *args, **kwargs):  # noqa: D401 - simple stub
                 """Do nothing."""
                 return None
-
+    
         class Interaction:  # type: ignore[override]
+            followup = _Followup()
             guild = None
             user = None
             followup = _Followup()
@@ -107,7 +108,7 @@ async def ensure_voice(interaction: "discord.Interaction") -> Optional["discord.
         await interaction.followup.send("This only works in a server (not DMs).", ephemeral=True)
         return None
 
-    vc: "discord.VoiceClient | None" = getattr(guild, "voice_client", None)
+    vc: Union["discord.VoiceClient", None] = getattr(guild, "voice_client", None)
     if vc and vc.is_connected():
         user = getattr(interaction, "user", None)
         user_voice = getattr(user, "voice", None)

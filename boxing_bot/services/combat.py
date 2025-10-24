@@ -97,7 +97,7 @@ def attack_exchange(attacker: FighterState, defender: FighterState, rng: random.
     return event
 
 
-async def send_round_card(interaction: "discord.Interaction", session: FightSession) -> None:
+async def send_round_card(interaction: discord.Interaction, session: FightSession) -> None:
     """Send an embed summarising the current round."""
 
     highlight = f"{session.A.name if session.A.adr >= session.B.adr else session.B.name} had the edge that round."
@@ -105,7 +105,7 @@ async def send_round_card(interaction: "discord.Interaction", session: FightSess
     await interaction.followup.send(embed=embed)
 
 
-async def send_finish_announcement(interaction: "discord.Interaction", session: FightSession) -> None:
+async def send_finish_announcement(interaction: discord.Interaction, session: FightSession) -> None:
     """Send an embed announcing the winner when the fight concludes."""
 
     title = f"{session.result}!"
@@ -114,7 +114,7 @@ async def send_finish_announcement(interaction: "discord.Interaction", session: 
     await interaction.followup.send(embed=embed)
 
 
-async def send_points_decision(interaction: "discord.Interaction", session: FightSession) -> None:
+async def send_points_decision(interaction: discord.Interaction, session: FightSession) -> None:
     """Send an embed summarising the judges' decision when the fight reaches the scorecards."""
 
     embed = discord.Embed(title="Decision", description="Fight goes to the cards. (Stub)")

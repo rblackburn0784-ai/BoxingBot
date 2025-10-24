@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from typing import Optional, List, Tuple
-
+import random
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -34,6 +34,7 @@ from ..config import (
     PROMO_IMG_EXTS,
     SETTINGS,
 )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Local helpers
@@ -110,7 +111,8 @@ def _render_promo_poster(first: str, second: str, img1: Optional[str], img2: Opt
     def centered(txt, y, font):
         bbox = draw.textbbox((0, 0), txt, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text(((W - tw) // 2, y), txt, fill=(240, 240, 240, 255), font=font, stroke_width=2, stroke_fill=(0, 0, 0, 255))
+        draw.text(((W - tw) // 2, y), txt, fill=(240, 240, 240, 255), font=font, stroke_width=2,
+                  stroke_fill=(0, 0, 0, 255))
 
     centered(first, int(H * 0.37), font_med)
     centered("VS", int(H * 0.44), font_big)
@@ -142,8 +144,9 @@ class MatchCog(commands.Cog):
         try:
             vc = await ensure_voice(interaction)
             if crowd:
-                await play_clip(vc, crowd, max_seconds=seconds)
-                await display_music_label(interaction, "Crowd ambience", seconds)
+                await play_clip(vc, crowd, seconds=seconds)
+                label = display_music_label(crowd)
+                await interaction.followup.send(f"🎵 Crowd ambience: {label} ({seconds}s clip)")
         except Exception:
             pass
 
@@ -152,50 +155,91 @@ class MatchCog(commands.Cog):
     async def start(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=False, thinking=True)
 
-        # Pick fighters (simple: first two in roster for this demo)
+        channel_id = interaction.channel_id
+        if channel_id is None:
+            await interaction.followup.send("This command must be used from a channel.")
+            return
+
         roster = list_boxers()
         if len(roster) < 2:
             await interaction.followup.send("Not enough fighters in roster.")
             return
-        a, b = roster[0], roster[1]
-        A = effective_boxer(a)
-        B = effective_boxer(b)
+        red_key, blue_key = roster[0], roster[1]
+        red_raw = get_boxer(red_key)
+        blue_raw = get_boxer(blue_key)
+        if not red_raw or not blue_raw:
+            await interaction.followup.send("Failed to load fighters from the roster.")
+            return
 
-        # Create session
-        s = FightSession(A=A, B=B)
+        red_eff = effective_boxer(red_raw)
+        blue_eff = effective_boxer(blue_raw)
 
-        # Store session by channel
-        SESSIONS[interaction.channel_id] = s
+        seed = random.randint(1, 1_000_000)
+        rng = random.Random(seed)
+        red_state = FighterState(boxer=red_eff, hp=red_eff.max_hp())
+        blue_state = FighterState(boxer=blue_eff, hp=blue_eff.max_hp())
 
-        # Fight Night embed with ring.gif
-        matchup = corner_assignments(A, B)  # returns (div, gender_key "MM/MF/FF", red_name, blue_name, art paths?)
-        gender_key = matchup.gender_key if hasattr(matchup, "gender_key") else "MM"
+        session = FightSession(
+            channel_id=channel_id,
+            rng_seed=seed,
+            rng=rng,
+            red_raw=red_raw,
+            blue_raw=blue_raw,
+            red_eff=red_eff,
+            blue_eff=blue_eff,
+            A=red_state,
+            B=blue_state,
+        )
 
-        ring_gif = RING_GIF_LOCAL.get(gender_key) or RING_GIF_URL.get(gender_key)
-        em = discord.Embed(title="🥊 Fight Night!", description=f"**In the Red Corner:** {A.name} — *{A.division}*\n\n**In the Blue Corner:** {B.name} — *{B.division}*")
+        SESSIONS[channel_id] = session
+
+        matchup = corner_assignments(session.A, session.B)
+        gender_key = getattr(matchup, "gender_key", "MM")
+
+        def _select_asset(source: object) -> Optional[str]:
+            if isinstance(source, dict):
+                return source.get(gender_key)
+            if isinstance(source, str):
+                return source or None
+            return None
+
+        ring_gif = _select_asset(RING_GIF_LOCAL) or _select_asset(RING_GIF_URL)
+        red_wc = session.red_raw.weight_class.title()
+        blue_wc = session.blue_raw.weight_class.title()
+        em = discord.Embed(
+            title="🥊 Fight Night!",
+            description=(
+                f"**In the Red Corner:** {session.red_raw.name} — *{red_wc}*\n\n"
+                f"**In the Blue Corner:** {session.blue_raw.name} — *{blue_wc}*"
+            ),
+        )
         if ring_gif:
             em.set_image(url=ring_gif)
         await interaction.followup.send(embed=em)
 
-        # Ensure crowd ambience plays during this panel
         await self._play_crowd(interaction, seconds=12)
 
-        # Fighter intros with round.gif + themes
-        round_gif = ROUND_GIF_LOCAL.get(gender_key) or ROUND_GIF_URL.get(gender_key)
-        intro = discord.Embed(title="Round 1 is coming up...", description=f"{A.name} and {B.name} make their way to center ring.")
+        round_gif = _select_asset(ROUND_GIF_LOCAL) or _select_asset(ROUND_GIF_URL)
+        intro = discord.Embed(
+            title="Round 1 is coming up...",
+            description=f"{session.red_raw.name} and {session.blue_raw.name} make their way to center ring.",
+        )
         if round_gif:
             intro.set_image(url=round_gif)
         await interaction.followup.send(embed=intro)
 
-        # Play short intro themes if available (15s each, ignore errors)
         try:
             vc = await ensure_voice(interaction)
-            if getattr(A, "theme", None) and os.path.exists(A.theme):
-                await play_clip(vc, A.theme, max_seconds=15)
-                await display_music_label(interaction, f"{A.name} theme", 15)
-            if getattr(B, "theme", None) and os.path.exists(B.theme):
-                await play_clip(vc, B.theme, max_seconds=15)
-                await display_music_label(interaction, f"{B.name} theme", 15)
+            red_theme = getattr(session.red_raw, "intro_music", "") or getattr(session.red_raw, "theme", "")
+            blue_theme = getattr(session.blue_raw, "intro_music", "") or getattr(session.blue_raw, "theme", "")
+            if red_theme and os.path.exists(red_theme):
+                await play_clip(vc, red_theme, seconds=15)
+                label = display_music_label(red_theme)
+                await interaction.followup.send(f"🎵 {session.red_raw.name} theme: {label} (15s clip)")
+            if blue_theme and os.path.exists(blue_theme):
+                await play_clip(vc, blue_theme, seconds=15)
+                label = display_music_label(blue_theme)
+                await interaction.followup.send(f"🎵 {session.blue_raw.name} theme: {label} (15s clip)")
         except Exception:
             pass
 
@@ -210,8 +254,7 @@ class MatchCog(commands.Cog):
             await interaction.followup.send("No active fight in this channel. Use `/start` first.")
             return
 
-        # Exactly 6 exchanges, alternating A/B
-        total = 6
+        total = s.exchanges_per_round if getattr(s, "exchanges_per_round", None) else 6
         lines: List[str] = []
         crowd_lines: List[str] = []
         for i in range(1, total + 1):
@@ -230,27 +273,35 @@ class MatchCog(commands.Cog):
             if tag and tag in CROWD_LINES:
                 crowd_lines.append(CROWD_LINES[tag].format(color="Red" if i % 2 == 1 else "Blue"))
 
-            if getattr(s, "is_over", False):
+            if finalize_if_done(s):
                 break
 
+        if lines:
+            s.log.append({"round": s.current_round, "events": lines})
+        if crowd_lines:
+            s.crowd_log.extend(crowd_lines)
+
         # Compose single round embed
-        title = f"Round {s.round_no}"
+        title = f"Round {s.current_round}"
         desc = "• " + "\n".join(lines) if lines else "—"
         em = discord.Embed(title=title, description=desc)
-        em.add_field(name=" ", value="**Momentum**", inline=False)
+        em.add_field(name="Momentum", value=momentum_bar(s.momentum), inline=False)
         em.add_field(
-            name=f"{s.A.name} (Red)  🟥",
-            value=_fighter_line(s.A_state, s.A.name, "🔴"),
+            name=f"{s.A.boxer.name} (Red)  🟥",
+            value=_fighter_line(s.A, s.A.boxer.name, "🔴"),
             inline=True,
         )
         em.add_field(
-            name=f"{s.B.name} (Blue) 🟦",
-            value=_fighter_line(s.B_state, s.B.name, "🔵"),
+            name=f"{s.B.boxer.name} (Blue) 🟦",
+            value=_fighter_line(s.B, s.B.boxer.name, "🔵"),
             inline=True,
         )
         em.add_field(
             name="Adrenaline",
-            value=f"🔴 {s.A.name}: {_bar(s.A_state.adr)} {s.A_state.adr}%\n🔵 {s.B.name}: {_bar(s.B_state.adr)} {s.B_state.adr}%",
+            value=(
+                f"🔴 {s.A.boxer.name}: {_bar(s.A.adrenaline)} {s.A.adrenaline}%\n"
+                f"🔵 {s.B.boxer.name}: {_bar(s.B.adrenaline)} {s.B.adrenaline}%"
+            ),
             inline=False,
         )
 
@@ -264,13 +315,13 @@ class MatchCog(commands.Cog):
         await send_round_card(interaction, s)
 
         # Finalize if KO/TKO/Points
-        if getattr(s, "is_over", False):
-            if getattr(s, "result", None) in ("KO", "TKO"):
+        if s.finished:
+            if (s.winner_type or "").upper() in {"KO", "TKO"}:
                 await send_finish_announcement(interaction, s)
             else:
                 await send_points_decision(interaction, s)
         else:
-            s.round_no += 1
+            s.current_round += 1
 
 
 async def setup(bot: commands.Bot):

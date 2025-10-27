@@ -1,68 +1,37 @@
-"""Domain models for BoxingBot."""
-from __future__ import annotations
+import discord
+from ..models import Boxer, STAT_NAMES, gender_badge
+from ..services.stats import apply_weight_modifiers
+from ..services.music import display_music_label
 
-from dataclasses import dataclass, field
-from typing import Dict, Iterable, Optional
-
-STAT_NAMES: tuple[str, ...] = (
-    "power",
-    "speed",
-    "accuracy",
-    "defense",
-    "footwork",
-    "stamina",
-    "chin",
-    "body",
-)
+def _bar(val: int, width: int = 10, fill: str = "█", empty: str = "—") -> str:
+    val = max(0, min(100, val))
+    n = round((val/100) * width)
+    return fill*n + empty*(width-n)
 
 
-def gender_badge(gender: str) -> str:
-    """Return an emoji badge for a gender string."""
-    normalized = (gender or "").strip().lower()
-    if normalized == "male":
-        return "♂️"
-    if normalized == "female":
-        return "♀️"
-    return "⚪"
+def boxer_embed(b: Boxer) -> discord.Embed:
+    corner_color = discord.Color.red() if b.gender == "male" else discord.Color.magenta()
+    e = discord.Embed(title=f"🥊 {b.name}", color=corner_color)
 
+    e.add_field(name="Gender", value=("Male ♂️" if b.gender == "male" else "Female ♀️"), inline=True)
+    e.add_field(name="Weight", value=f"{b.weight_kg:.1f} kg • {b.weight_class.title()}", inline=True)
+    e.add_field(name="Trait", value=b.trait or "—", inline=True)
+    e.add_field(name="HP", value=str(b.max_hp()), inline=True)
 
-@dataclass(slots=True)
-class Boxer:
-    """A simple representation of a boxer profile."""
+    eff = apply_weight_modifiers(
+        {
+            "power": b.power, "speed": b.speed, "accuracy": b.accuracy, "defense": b.defense,
+            "footwork": b.footwork, "stamina": b.stamina, "chin": b.chin, "body": b.body
+        },
+        b.weight_class
+    )
+    for s in STAT_NAMES:
+        e.add_field(name=s.capitalize(), value=str(eff[s]))
 
-    name: str
-    gender: str
-    weight_kg: float
-    weight_class: str
-    trait: Optional[str] = None
-    intro_music: Optional[str] = None
-    intro: Optional[str] = None
+    if b.intro_music:
+        e.add_field(name="Intro Music", value=display_music_label(b.intro_music), inline=False)
+    if b.intro:
+        e.add_field(name="Intro", value=b.intro[:1024], inline=False)
 
-    power: int = 0
-    speed: int = 0
-    accuracy: int = 0
-    defense: int = 0
-    footwork: int = 0
-    stamina: int = 0
-    chin: int = 0
-    body: int = 0
-
-    _hp_bonus: int = field(default=0, repr=False)
-
-    def base_stats(self) -> Dict[str, int]:
-        """Return a dictionary of the boxer's raw stats."""
-        return {name: getattr(self, name) for name in STAT_NAMES}
-
-    def total_points(self) -> int:
-        """Total of the raw stat points."""
-        return sum(self.base_stats().values())
-
-    def max_hp(self) -> int:
-        """Compute a simple hit point value for display purposes."""
-        stamina_component = max(0, self.stamina)
-        return 50 + stamina_component + self._hp_bonus
-
-    def as_stat_iter(self) -> Iterable[tuple[str, int]]:
-        """Iterate over stat name/value pairs."""
-        for name in STAT_NAMES:
-            yield name, getattr(self, name)
+    e.set_footer(text=f"Total base points: {b.total_points()} / 100 • Stats shown include weight-class modifiers")
+    return e

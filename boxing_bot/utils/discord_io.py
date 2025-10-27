@@ -1,6 +1,5 @@
 import discord
 
-
 async def respond(interaction: discord.Interaction, *args, **kwargs):
     try:
         if not interaction.response.is_done():

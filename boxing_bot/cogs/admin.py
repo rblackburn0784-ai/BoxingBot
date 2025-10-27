@@ -5,9 +5,8 @@ from discord.ext import commands
 from ..config import SETTINGS
 from ..storage.db import DB, save_db
 
-
 class Admin(commands.Cog):
-    def __init__(self, bot):
+    def __init__(self, bot): 
         self.bot = bot
 
     @commands.hybrid_command(description="Show simple DB info.")
@@ -43,7 +42,6 @@ class Admin(commands.Cog):
         else:
             msg = "❌ FFmpeg not found. Install it and set FFMPEG_PATH or add to PATH."
         await ctx.reply(msg)
-
 
 async def setup(bot):
     await bot.add_cog(Admin(bot))

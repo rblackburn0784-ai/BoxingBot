@@ -1,328 +1,1297 @@
-from __future__ import annotations
+# boxing_bot/cogs/match.py
 
-import asyncio
 import os
-from typing import Optional, List, Tuple
 import random
 import discord
+import asyncio
+from typing import Optional, List
 from discord import app_commands
 from discord.ext import commands
-
+from pathlib import Path
 from ..models import FightSession, FighterState
-from ..services.state import SESSIONS
 from ..services.roster import get_boxer, list_boxers
 from ..services.stats import effective_boxer
-from ..services.presentation import momentum_bar
-from ..services.music import display_music_label
-from ..services.voice import ensure_voice, play_clip
 from ..services.combat import (
-    attack_exchange,
+    corner_assignments,
+    run_one_round,
     finalize_if_done,
     send_round_card,
     send_points_decision,
     send_finish_announcement,
-    corner_assignments,
-    CROWD_LINES,
+    _crowd_round_reset,
+    _ensure_crowd_state,
+    maybe_post_reaction_and_audio,
 )
+from ..services.presentation import momentum_bar
+
+from ..services.state import SESSIONS
+from ..services.voice import ensure_voice, play_clip
+from ..services.music import display_music_label
 from ..config import (
     RING_GIF_LOCAL,
     RING_GIF_URL,
     ROUND_GIF_LOCAL,
-    ROUND_GIF_URL,
-    PROMO_DIR,
-    PROMO_MUSIC_DIR,
-    PROMO_IMG_EXTS,
-    SETTINGS,
+    ROUND_GIF_URL, PROMO_DIR, PROMO_MUSIC_DIR, PROMO_IMG_EXTS, FFMPEG_PATH,
+    CROWD_REACTIONS,        # already there
+    COMMENTARY_DIR,         # ← add this
 )
 
+# ----- Local helpers (presentation) -----
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Local helpers
+def _hp_blocks(hp: int, max_hp: int = 100) -> str:
+    hp = max(0, min(max_hp, int(hp)))
+    blocks = hp // 10  # 10 HP per block
+    return "█" * blocks + "░" * (10 - blocks)
 
-def _bar(val: int, width: int = 12, fill: str = "█", empty: str = "—") -> str:
-    val = max(0, min(100, int(val)))
-    n = round((val / 100) * width)
-    return fill * n + empty * (width - n)
+async def _send_short_status(interaction: discord.Interaction, s: FightSession):
+    emb = discord.Embed(
+        title=f"Round {s.current_round} — Live",
+        description=f"Momentum {momentum_bar(s.momentum, 20)}",
+        color=discord.Color.dark_teal()
+    )
+    emb.add_field(
+        name=f"🔴 {s.A.boxer.name} (Red)",
+        value=f"`{_hp_blocks(s.A.hp)}`  • Adr {int(s.A.adrenaline)}%",
+        inline=False
+    )
+    emb.add_field(
+        name=f"🔵 {s.B.boxer.name} (Blue)",
+        value=f"`{_hp_blocks(s.B.hp)}`  • Adr {int(s.B.adrenaline)}%",
+        inline=False
+    )
+    await interaction.followup.send(embed=emb)
 
+# ── Exchange text builder (no momentum/HP here) ────────────────────────────
+def _brief_exchange_text(ev: dict) -> str:
+    a = ev.get("attacker", "Attacker")
+    d = ev.get("defender", "Defender")
+    oc = ev.get("outcome", "")
+    dmg = ev.get("damage")
+    ht  = ev.get("hit_type") or ev.get("type")
+    loc = ev.get("location")
 
-def _fighter_line(fs: FighterState, name: str, emoji: str) -> str:
-    hp = max(0, min(100, fs.hp))
-    return f"{emoji} **{name}**\nHP: {_bar(hp)} {hp}%"
+    if oc == "hit":
+        parts = [f"{a} lands"]
+        if ht:  parts.append(f"a *{ht}*")
+        if loc: parts.append(f"to **{loc}**")
+        if dmg is not None: parts.append(f"for **{int(dmg)}**")
+        parts.append(f"on {d}")
+        if ev.get("knockdown"): parts.append("— **knockdown!**")
+        return " ".join(parts)
+    if oc == "miss":
+        return f"{a} overreaches and misses {d}"
+    if oc == "critical_miss":
+        return f"{a} whiffs badly — **critical miss!**"
+    if oc == "low_blow":
+        return f"{a} strays low — **warning issued**"
+    # fallback
+    return f"{a} and {d} trade."
 
+# === Commentary clip selection =================================================
 
-def _safe_gif(map_obj: dict, key: Tuple[str, str, str]) -> Optional[str]:
-    # key = (MM/MF/FF, corner 'Red'/'Blue', tag)
-    if key in map_obj:
-        return map_obj[key]
-    # fallback by ignoring color
-    k2 = (key[0], "*", key[2])
-    return map_obj.get(k2)
+# Known, generic clip names you have in the folder (from your screenshot):
+# KD.mp3, Low_Blow.mp3, Swing_Miss.mp3, Tidy_Block.mp3, Mind_Belt.mp3
+# Red_* and Blue_* variants for: Jab, Cross, hook, Uppercut, Block, Guard, Slip, Pressure, Momentum, OverCommits, Cooking, Felt, Fold, Down, Fely (typo?), etc.
 
+# Back-compat: some callers may pass (session, round_idx)
+def _ensure_crowd_state(session: FightSession, *_, **__):
+    if not hasattr(session, "_crowd_seen_families"):
+        session._crowd_seen_families = set()
+    if not hasattr(session, "_crowd_last_line"):
+        session._crowd_last_line = ""
+    if not hasattr(session, "momentum"):
+        session.momentum = 0
+    if not hasattr(session, "crowd_hype"):
+        session.crowd_hype = 0
 
-def _render_promo_poster(first: str, second: str, img1: Optional[str], img2: Optional[str]) -> Optional[str]:
+def _commentary_exists(name: str) -> Optional[str]:
+    """Return a full path if file exists in COMMENTARY_DIR, else None."""
+    path = os.path.join(COMMENTARY_DIR, name)
+    return path if os.path.exists(path) else None
+
+def _corner_from_names(session: FightSession, fighter_name: str) -> str:
+    return "Red" if session.A.boxer.name == fighter_name else "Blue"
+
+def _title_case_hit(hit: Optional[str]) -> Optional[str]:
+    if not hit: return None
+    # folder uses 'hook' lower-case in screenshot; we normalize to first upper except hook
+    mapping = {"jab": "Jab", "cross": "Cross", "hook": "Hook", "uppercut": "Uppercut", "glancing":"Glancing"}
+    return mapping.get(hit.lower())
+
+def _resolve_commentary_file(session: FightSession, ev: dict, tags: list[str]) -> Optional[str]:
+    """
+    Map crowd tags + event details to best-matching mp3 filename.
+    Preference order: KD / Low_Blow / (hit-type by corner) / block / miss / slip / momentum / generic.
+    """
+    corner = _corner_from_names(session, ev.get("attacker"))
+    hit = _title_case_hit(ev.get("hit_type"))
+    blocked = bool(ev.get("blocked"))
+    block_ok = ev.get("block_success")
+
+    tag_text = " ".join(tags)
+
+    # 1) Knockdown
+    if "KD_" in tag_text:
+        p = _commentary_exists("KD.mp3")
+        if p: return p
+
+    # 2) Low blow
+    if "LOWBLOW_" in tag_text or ev.get("outcome") == "low_blow":
+        p = _commentary_exists("Low_Blow.mp3")
+        if p: return p
+
+    # 3) Big hit → try per-corner + hit-type: Red_Uppercut.mp3 etc.
+    if "BIG_" in tag_text or (ev.get("outcome") == "hit" and ev.get("damage",0) >= 14):
+        if hit:
+            p = _commentary_exists(f"{corner}_{hit}.mp3")
+            if p: return p
+        # fallbacks if no exact hit-type file
+        p = _commentary_exists(f"{corner}_Pressure.mp3")
+        if p: return p
+        p = _commentary_exists(f"{corner}_Cooking.mp3")
+        if p: return p
+
+    # 4) Normal hit → prefer per-corner + hit-type
+    if ev.get("outcome") == "hit":
+        if hit:
+            p = _commentary_exists(f"{corner}_{hit}.mp3")
+            if p: return p
+        # Block commentary if present
+        if blocked:
+            if block_ok is True:
+                p = _commentary_exists("Tidy_Block.mp3") or _commentary_exists(f"{corner}_Block.mp3")
+                if p: return p
+            else:
+                p = _commentary_exists(f"{corner}_Block.mp3")
+                if p: return p
+        # generic touch
+        p = _commentary_exists(f"{corner}_Felt.mp3") or _commentary_exists(f"{corner}_Guard.mp3")
+        if p: return p
+
+    # 5) Miss / Critical miss
+    if ev.get("outcome") in ("miss","critical_miss"):
+        # Try generic swing miss first
+        p = _commentary_exists("Swing_Miss.mp3")
+        if p: return p
+        # Then a slip flavor (defender makes him miss)
+        p = _commentary_exists(f"{_corner_from_names(session, ev.get('defender'))}_Slip.mp3")
+        if p: return p
+
+    # 6) Momentum call (if you keep a momentum eruption tag; optional)
+    if "MOMENTUM_" in tag_text:
+        p = _commentary_exists(f"{corner}_Momentum.mp3")
+        if p: return p
+
+    # 7) Down / Fold flavors (if someone “folds” or is “down” by damage—optional heuristics)
+    if ev.get("knockdown"):
+        p = _commentary_exists(f"{_corner_from_names(session, ev.get('defender'))}_Down.mp3")
+        if p: return p
+
+    # 8) Generic last-resort
+    return _commentary_exists("Mind_Belt.mp3")  # harmless short filler if present
+
+async def play_commentary_for_event(interaction: discord.Interaction, session: FightSession, ev: dict):
+    """Play a short commentary clip if a crowd line was posted."""
     try:
-        from PIL import Image, ImageDraw, ImageFont, ImageOps
+        tags = ev.get("crowd_tags") or []
+        if not tags:
+            return
+        path = _resolve_commentary_file(session, ev, tags)
+        if not path:
+            return
+
+        vc = await ensure_voice(interaction)
+        if not vc:
+            return
+
+        # keep it snappy; stop older short clip if playing
+        if vc.is_playing():
+            vc.stop()
+
+        # 2–3 seconds is perfect; your play_clip helper supports a seconds param
+        await play_clip(vc, path, seconds=3)
+        # tiny gap to avoid stepping on the next exchange by accident
+        await asyncio.sleep(0.05)
+    except Exception as e:
+        print(f"[commentary] failed: {e}")
+
+# ── Crowd selection (same anti-spam logic as earlier) ──────────────────────
+_CROWD_FAMILY = {
+    "KD_RED": "KD", "KD_BLUE": "KD",
+    "BIG_RED": "BIG", "BIG_BLUE": "BIG",
+    "CRITMISS_RED": "CRITMISS", "CRITMISS_BLUE": "CRITMISS",
+    "LOWBLOW_RED": "LOWBLOW", "LOWBLOW_BLUE": "LOWBLOW",
+}
+_CROWD_PRIORITY = ["KD_RED", "KD_BLUE", "BIG_RED", "BIG_BLUE",
+                   "CRITMISS_RED", "CRITMISS_BLUE", "LOWBLOW_RED", "LOWBLOW_BLUE"]
+
+def _pick_crowd_line_for_event(s: FightSession, ev: dict) -> Optional[str]:
+    # make sure per-round state exists
+    _ensure_crowd_state(s)
+
+    tags = ev.get("crowd_tags") or []
+    if not tags:
+        return None
+
+    # sort by our global priority
+    tags_sorted = sorted(tags, key=lambda t: _CROWD_PRIORITY.index(t) if t in _CROWD_PRIORITY else 999)
+
+    for t in tags_sorted:
+        fam = _CROWD_FAMILY.get(t)
+        if fam and fam in getattr(s, "_crowd_seen_families", set()):
+            continue
+
+        pool = CROWD_REACTIONS.get(t) or []
+        if not pool:
+            continue
+
+        # avoid repeating the last exact line if possible
+        last = getattr(s, "_crowd_last_line", "")
+        if len(pool) > 1:
+            choices = [p for p in pool if p != last] or pool
+        else:
+            choices = pool
+
+        cand = random.choice(choices)
+        if fam:
+            s._crowd_seen_families.add(fam)
+        s._crowd_last_line = cand
+        return cand
+
+    return None
+
+def _crowd_round_reset(s: FightSession):
+    s._crowd_seen_families = set()
+    s._crowd_last_line = ""
+
+
+async def _send_exchange_note(
+    interaction: discord.Interaction,
+    s: FightSession,
+    ev: dict,
+    crowd_line: Optional[str] = None,
+):
+    body = _brief_exchange_text(ev)
+    desc_lines = []
+    if crowd_line:
+        desc_lines.append(crowd_line)
+    desc_lines.append(f"**Exchange:** {body}")
+
+    emb = discord.Embed(
+        title=f"Round {s.current_round} — Exchange",
+        description="\n".join(desc_lines),
+        color=discord.Color.dark_teal()
+    )
+    await interaction.followup.send(embed=emb)
+
+# ⬇️ helper: map tags to lines and send them immediately
+async def _send_crowd_lines_for_event(interaction: discord.Interaction, s: FightSession, ev: dict):
+    line = _pick_crowd_line_for_event(s, ev)
+    if line:
+        await interaction.followup.send(line)
+
+
+# === Promo state (per channel) ===
+PROMO_ACTIVE: dict[int, bool] = {}
+PROMO_TASKS: dict[int, asyncio.Task] = {}
+
+AUDIO_EXTS = (".mp3", ".wav", ".ogg", ".m4a")
+
+def _resolve_music_dir() -> Path:
+    """
+    Return the best guess music directory, without double-joining segments.
+    Prefers an existing directory among several sensible candidates.
+    """
+    pkg_root = Path(__file__).resolve().parents[2]  # project root
+    raw = Path(PROMO_MUSIC_DIR)
+
+    candidates: list[Path] = []
+
+    # 1) If PROMO_MUSIC_DIR is absolute, try it as-is.
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        # 2) Try relative to the package root (project root)
+        candidates.append((pkg_root / raw).resolve())
+        # 3) Try relative to current working dir (just in case you run from a different cwd)
+        candidates.append((Path.cwd() / raw).resolve())
+
+    # 4) Also try common defaults if the above don’t exist
+    candidates.append((pkg_root / "graphics" / "promo" / "music").resolve())
+    candidates.append((pkg_root / "graphics" / "promo").resolve())
+
+    # Pick the first existing directory
+    for c in candidates:
+        if c.exists() and c.is_dir():
+            return c
+
+    # Fallback: return the first candidate even if it doesn’t exist (so we can show it in the error)
+    return candidates[0]
+
+
+def _find_first_audio(music_dir: Path) -> Optional[Path]:
+    if not music_dir.exists():
+        return None
+    for root, _, files in os.walk(music_dir):
+        for fn in files:
+            if fn.lower().endswith(AUDIO_EXTS):
+                return Path(root) / fn
+    return None
+
+
+# === new/updated poster renderer ===
+def _render_promo_poster(name_left: str, name_right: str,
+                         img_left: Optional[str], img_right: Optional[str],
+                         out_w: int = 1280, out_h: int = 720) -> Optional[str]:
+    """Promo poster with stacked title centered, fighter images flanking the title, and transparent flames."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageStat
     except Exception:
         return None
 
-    # Background candidates
-    bg_candidates = [
-        os.path.join(PROMO_DIR, "ring_bg.png"),
-        os.path.join(PROMO_DIR, "ring_bg.jpg"),
-        os.path.join(PROMO_DIR, "ring_bg.webp"),
-    ]
-    bg_path = next((p for p in bg_candidates if os.path.exists(p)), None)
-    if bg_path:
-        bg = Image.open(bg_path).convert("RGBA")
-    else:
-        bg = Image.new("RGBA", (1280, 720), (8, 12, 16, 255))
+    # ---------- Tunables ----------
+    NAME_SIZE = 170         # left/right names
+    VS_SIZE   = 130         # VS
+    TAGLINE_SIZE = 40
+    TITLE_BAND_RATIO = 0.42   # how much vertical space top band uses
+    SIDE_MARGIN = 36
+    BETWEEN_TITLE_AND_IMAGE = 22   # horizontal breathing room between title column & each image
+    IMG_MAX_W = 360               # cap fighter width (they’ll scale down to fit)
+    IMG_MAX_H_RATIO = 0.56        # fraction of canvas height available for fighter images inside band
+    FLAME_SCALE = 1.10            # flame height relative to VS font size
+    TAGLINE_TEXT = "A night of glory, grit, and guts — live in TheDude Boxing Federation."
 
-    W, H = bg.size
-    canvas = bg.copy()
+    # ---------- assets ----------
+    try:
+        from ..config import PROMO_DIR
+    except Exception:
+        PROMO_DIR = "./graphics/promo"
+    bg_path = os.path.join(PROMO_DIR, "background.png")
+    flame_path = os.path.join(PROMO_DIR, "icons", "flame.png")
+
+    font_candidates = [
+        os.path.join(PROMO_DIR, "fonts", "BebasNeue-Regular.ttf"),
+        os.path.join(PROMO_DIR, "fonts", "Anton-Regular.ttf"),
+        os.path.join(PROMO_DIR, "fonts", "Impact.ttf"),
+    ]
+    def _load_font(size: int):
+        for fp in font_candidates:
+            if os.path.exists(fp):
+                try: return ImageFont.truetype(fp, size=size)
+                except Exception: pass
+        return ImageFont.load_default()
+
+    # ---------- canvas ----------
+    canvas = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 255))
+    if os.path.exists(bg_path):
+        bg = Image.open(bg_path).convert("RGBA")
+        r = max(out_w / bg.width, out_h / bg.height)
+        bg = bg.resize((int(bg.width * r), int(bg.height * r)), Image.LANCZOS)
+        x = (bg.width - out_w) // 2
+        y = (bg.height - out_h) // 2
+        canvas.paste(bg.crop((x, y, x + out_w, y + out_h)), (0, 0))
+    else:
+        grad = Image.new("RGBA", (1, out_h), 0)
+        g = ImageDraw.Draw(grad)
+        for i in range(out_h):
+            c = (int(30 + 8*i/out_h), int(10 + 18*i/out_h), int(45 + 40*i/out_h), 255)
+            g.point((0, i), fill=c)
+        canvas = grad.resize((out_w, out_h), Image.BILINEAR)
+
+    # readability overlays
+    overlay = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
+    o = ImageDraw.Draw(overlay)
+    title_band_h = int(out_h * TITLE_BAND_RATIO)
+    o.rectangle([0, 0, out_w, title_band_h], fill=(0, 0, 0, 120))
+    o.rectangle([0, title_band_h, out_w, out_h], fill=(0, 0, 0, 60))
+    canvas = Image.alpha_composite(canvas, overlay)
     draw = ImageDraw.Draw(canvas)
 
-    # Try fighter images
-    def load_fit(pth):
-        if not pth or not os.path.exists(pth):
+    # ---------- title text (center column) ----------
+    font_left  = _load_font(NAME_SIZE)
+    font_vs    = _load_font(VS_SIZE)
+    font_right = _load_font(NAME_SIZE)
+    font_tag   = _load_font(TAGLINE_SIZE)
+
+    def size(text: str, font: ImageFont.FreeTypeFont) -> tuple[int, int]:
+        """Width/height across Pillow versions (textlength or textbbox)."""
+        try:
+            w = draw.textlength(text, font=font)        # newer Pillow
+        except Exception:
+            # fallback: textbbox
+            bbox = draw.textbbox((0, 0), text, font=font)  # (l, t, r, b)
+            w = bbox[2] - bbox[0]
+        # height: use bbox for accuracy
+        try:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            h = (bbox[3] - bbox[1]) + 8
+        except Exception:
+            h = font.size + 8
+        return int(w), int(h)
+
+    l_text, vs_text, r_text = name_left, "VS", name_right
+    l_w, l_h = size(l_text, font_left)
+    v_w, v_h = size(vs_text, font_vs)
+    r_w, r_h = size(r_text, font_right)
+
+    # column width = max of the three lines
+    col_w = max(l_w, v_w, r_w)
+    col_x = (out_w - col_w) // 2
+    # vertically center block within title band
+    total_h = l_h + v_h + r_h + 8
+    start_y = max(16, (title_band_h - total_h) // 2)
+
+    # glow writer
+    def glow(x, y, text, font, fill, radii=(8, 3)):
+        for r in radii:
+            tmp = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
+            td = ImageDraw.Draw(tmp)
+            td.text((x, y), text, font=font, fill=(255, 255, 255, 255))
+            tmp = tmp.filter(ImageFilter.GaussianBlur(radius=r))
+            canvas.alpha_composite(tmp)
+        draw.text((x, y), text, font=font, fill=fill)
+
+    colL, colVS, colR = (255, 95, 95, 255), (255, 230, 90, 255), (95, 160, 255, 255)
+
+    y = start_y
+    glow(col_x + (col_w - l_w)//2, y, l_text, font_left,  colL); y += l_h
+    vs_x = col_x + (col_w - v_w)//2
+    vs_y = y
+    glow(vs_x, vs_y, vs_text, font_vs, colVS); y += v_h
+    glow(col_x + (col_w - r_w)//2, y, r_text, font_right, colR); y += r_h
+
+    # tagline (directly under title block)
+    tag_y = y + 10
+    tag_w = draw.textlength(TAGLINE_TEXT, font=font_tag)
+    tag_x = (out_w - tag_w) // 2
+    for dx, dy in ((2,2),(3,3)):
+        draw.text((tag_x+dx, tag_y+dy), TAGLINE_TEXT, font=font_tag, fill=(0,0,0,180))
+    draw.text((tag_x, tag_y), TAGLINE_TEXT, font=font_tag, fill=(240,240,240,240))
+
+    # --- replace your _load_flame with this version ---
+    def _load_flame(path: str, target_h: int) -> Optional[Image.Image]:
+        """
+        Load a flame PNG and synthesize a clean alpha if the file has a baked gray/ checkerboard BG.
+        We keep high-saturation, bright pixels (flame) and drop low-sat gray (background).
+        """
+        from PIL import Image, ImageChops, ImageFilter, ImageStat
+
+        if not os.path.exists(path):
             return None
-        im = Image.open(pth).convert("RGBA")
-        return ImageOps.contain(im, (int(W * 0.40), int(H * 0.85)))
 
-    L = load_fit(img1)
-    R = load_fit(img2)
+        im = Image.open(path).convert("RGBA")
+        w, h = im.size
 
+        # If the png already has a sensible alpha, use it.
+        try:
+            A = im.getchannel("A")
+            s = int(ImageStat.Stat(A).sum[0])
+            if 0 < s < 255 * w * h:  # already has mixed transparency
+                pass  # keep
+            else:
+                # Build an alpha from chroma (HSV saturation * value) and de-gray it.
+                RGB = im.convert("RGB")
+                HSV = RGB.convert("HSV")
+                H, S, V = HSV.split()  # 0..255 each
+
+                # Emphasize saturation (colorfulness) and brightness together.
+                SV = ImageChops.multiply(S, V)  # 0..255
+                # Boost a bit so mid oranges become solid.
+                SV = SV.point(lambda p: min(255, int(p * 1.4)))
+
+                # Remove neutral grays explicitly: |R-G| and |R-B| small ⇒ background
+                R, G, B = RGB.split()
+                RG = ImageChops.difference(R, G)
+                RB = ImageChops.difference(R, B)
+                chroma = ImageChops.lighter(RG, RB)  # bigger ⇒ more colorful
+
+                # Combine: strong alpha where (SV high) AND (chroma high)
+                # thresholds tuned empirically; tweak if needed
+                keep = ImageChops.multiply(
+                    SV.point(lambda p: 255 if p > 110 else 0),
+                    chroma.point(lambda p: 255 if p > 22 else 0),
+                )
+
+                # Slight feather so edges aren’t jaggy
+                keep = keep.filter(ImageFilter.GaussianBlur(1.2))
+                im.putalpha(keep)
+        except Exception:
+            # If anything above fails, just keep the original and hope it had alpha.
+            pass
+
+        # Scale to target height
+        scale = target_h / im.height
+        new_size = (max(1, int(im.width * scale)), max(1, int(target_h)))
+        return im.resize(new_size, Image.LANCZOS)
+
+    flame_h = int(font_vs.size * FLAME_SCALE)
+    flame = _load_flame(flame_path, flame_h)
+    if flame:
+        left_fx = max(SIDE_MARGIN, vs_x - flame.width - 20)
+        right_fx = min(out_w - SIDE_MARGIN - flame.width, vs_x + v_w + 20)
+
+        # paste ON TOP of everything with flame’s alpha
+        canvas.paste(flame, (left_fx, vs_y - 6), mask=flame)
+        flame_mirror = flame.transpose(Image.FLIP_LEFT_RIGHT)
+        canvas.paste(flame_mirror, (right_fx, vs_y - 6), mask=flame_mirror)
+
+    # ---------- fighter images FLANKING the title column ----------
+    content_top = int(out_h * 0.10)  # top edge of title band
+    img_zone_h  = int(out_h * IMG_MAX_H_RATIO)
+    img_max_h   = min(img_zone_h, title_band_h - 20)
+
+    def load_fit(path):
+        if not path: return None
+        try:
+            im = Image.open(path).convert("RGBA")
+        except Exception:
+            return None
+        return ImageOps.contain(im, (IMG_MAX_W, img_max_h), method=Image.LANCZOS)
+
+    L = load_fit(img_left)
+    R = load_fit(img_right)
+
+    def shadow_paste(base, im, x, y):
+        if im is None: return
+        sh = Image.new("RGBA", (im.width+32, im.height+32), (0,0,0,0))
+        sd = ImageDraw.Draw(sh)
+        sd.rectangle([16,16,16+im.width,16+im.height], fill=(0,0,0,160))
+        sh = sh.filter(ImageFilter.GaussianBlur(12))
+        base.alpha_composite(sh, (x-16, y-16))
+        base.alpha_composite(im, (x, y))
+
+    # place left image to the left of the title column, vertically centered within band
     if L:
-        canvas.alpha_composite(L, (int(W * 0.08), int((H - L.height) // 2)))
+        Lx = max(SIDE_MARGIN, col_x - BETWEEN_TITLE_AND_IMAGE - L.width)
+        Ly = content_top + (title_band_h - L.height)//2
+        shadow_paste(canvas, L, Lx, Ly)
+
+    # place right image to the right of the title column
     if R:
-        canvas.alpha_composite(R, (int(W - (W * 0.08) - R.width), int((H - R.height) // 2)))
+        Rx = min(out_w - SIDE_MARGIN - R.width, col_x + col_w + BETWEEN_TITLE_AND_IMAGE)
+        Ry = content_top + (title_band_h - R.height)//2
+        shadow_paste(canvas, R, Rx, Ry)
 
-    # Center stripe
-    from PIL import Image
+    # ---------- save ----------
+    out_name = f"_poster_{int(asyncio.get_running_loop().time() * 1000)}.png"
+    out_path = os.path.join(PROMO_DIR, out_name)
+    try:
+        canvas.save(out_path)
+        return out_path
+    except Exception:
+        return None
 
-    overlay = Image.new("RGBA", (int(W * 0.36), int(H * 0.30)), (0, 0, 0, 140))
-    canvas.alpha_composite(overlay, (int(W * 0.32), int(H * 0.35)))
+
+
+def _fancy(text: str) -> str:
+    # simple fancy (Mathematical Bold) where possible; fallback regular chars
+    bold_map = str.maketrans(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+        "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙"
+        "𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝐮𝐯𝐰𝐱𝐲𝐳"
+    )
+    return text.translate(bold_map)
+
+
+def _promo_image_for_name(name: str) -> Optional[str]:
+    base = os.path.join(PROMO_DIR, name)
+    # try exact with known exts
+    for ext in PROMO_IMG_EXTS:
+        p = base + ext
+        if os.path.exists(p):
+            return p
+    # try lowercased
+    base = os.path.join(PROMO_DIR, name.lower())
+    for ext in PROMO_IMG_EXTS:
+        p = base + ext
+        if os.path.exists(p):
+            return p
+    return None
+
+
+async def _ensure_voice(interaction: discord.Interaction) -> Optional[discord.VoiceClient]:
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send("This only works in a server (not DMs).", ephemeral=True)
+        return None
+    vc = guild.voice_client
+    if vc and vc.is_connected():
+        if interaction.user and getattr(interaction.user, "voice", None):
+            ch = interaction.user.voice.channel
+            if vc.channel != ch:
+                await vc.move_to(ch)
+        return vc
+    if not interaction.user or not getattr(interaction.user, "voice", None):
+        await interaction.followup.send("Join a **voice channel** first so I can play the promo music.",
+                                        ephemeral=True)
+        return None
+    try:
+        return await interaction.user.voice.channel.connect(reconnect=True)
+    except Exception as e:
+        await interaction.followup.send(f"Couldn’t join your voice channel: `{e}`", ephemeral=True)
+        return None
+
+
+async def _play_once(
+    vc: discord.VoiceClient,
+    path: str,
+    seconds: Optional[float] = None,
+    fade_out: float = 0.0
+):
+    if not os.path.exists(path):
+        return
+    if vc.is_playing():
+        vc.stop()
+
+    before_opts = "-nostdin"
+    # IMPORTANT: on Windows quoting can be touchy; avoid shell quotes and pass raw -af args.
+    opts = "-vn"
+    if seconds:
+        opts += f" -t {float(seconds):.2f}"
+        if fade_out and fade_out > 0:
+            st = max(0.0, float(seconds) - float(fade_out))
+            # No quotes around the filter expression => FFmpegPCMAudio will pass args properly cross-platform
+            opts += f" -af afade=t=out:st={st:.2f}:d={float(fade_out):.2f}"
+
+    audio = discord.FFmpegPCMAudio(
+        path,
+        executable=FFMPEG_PATH,
+        before_options=before_opts,
+        options=opts
+    )
+    vc.play(audio)
+    while vc.is_playing():
+        await asyncio.sleep(0.3)
+
+
+async def _promo_music_loop(interaction: discord.Interaction, track_path: str):
+    """Loop until PROMO_ACTIVE[channel_id] becomes False."""
+    vc = await _ensure_voice(interaction)
+    if not vc:
+        return
+    ch_id = interaction.channel_id
+    while PROMO_ACTIVE.get(ch_id, False):
+        try:
+            await _play_once(vc, track_path, seconds=None)  # full track
+        except Exception:
+            await asyncio.sleep(2.0)
+
+
+async def stop_promo_music(interaction: discord.Interaction):
+    ch_id = interaction.channel_id
+    PROMO_ACTIVE[ch_id] = False
+    task = PROMO_TASKS.pop(ch_id, None)
+    if task and not task.done():
+        task.cancel()
+    # also stop current voice playback if any
+    vc = interaction.guild.voice_client if interaction.guild else None
+    if vc and vc.is_connected() and vc.is_playing():
+        vc.stop()
+
+
+def _compose_side_by_side(path_left: str, path_right: str) -> Optional[str]:
+    """
+    Try to compose /graphics/promo/_composite_<timestamp>.png using Pillow.
+    Fallback: return None if Pillow not available or error.
+    """
+    try:
+        from PIL import Image, ImageOps
+    except Exception:
+        return None
 
     try:
-        font_big = ImageFont.truetype("arial.ttf", size=int(H * 0.12))
-        font_med = ImageFont.truetype("arial.ttf", size=int(H * 0.06))
+        left = Image.open(path_left).convert("RGBA")
+        right = Image.open(path_right).convert("RGBA")
+        # make same height
+        h = max(left.height, right.height)
+
+        def fit_h(im):
+            return ImageOps.contain(im, (im.width * 10, h))  # keep width, limit height to h
+
+        left = fit_h(left)
+        right = fit_h(right)
+
+        # pad to same height exactly
+        def pad_to_h(im):
+            if im.height == h: return im
+            new = Image.new("RGBA", (im.width, h), (0, 0, 0, 0))
+            y = (h - im.height) // 2
+            new.paste(im, (0, y))
+            return new
+
+        left = pad_to_h(left)
+        right = pad_to_h(right)
+
+        # combine
+        gap = 24
+        w = left.width + gap + right.width
+        combo = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        combo.paste(left, (0, 0))
+        combo.paste(right, (left.width + gap, 0))
+        out_path = os.path.join(PROMO_DIR, f"_composite_{int(asyncio.get_running_loop().time() * 1000)}.png")
+        combo.save(out_path)
+        return out_path
     except Exception:
-        font_big = font_med = ImageFont.load_default()
-
-    def centered(txt, y, font):
-        bbox = draw.textbbox((0, 0), txt, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text(((W - tw) // 2, y), txt, fill=(240, 240, 240, 255), font=font, stroke_width=2,
-                  stroke_fill=(0, 0, 0, 255))
-
-    centered(first, int(H * 0.37), font_med)
-    centered("VS", int(H * 0.44), font_big)
-    centered(second, int(H * 0.56), font_med)
-
-    os.makedirs(PROMO_DIR, exist_ok=True)
-    out = os.path.join(PROMO_DIR, f"poster_{first}_vs_{second}.png").replace(" ", "_")
-    canvas.save(out)
-    return out
+        return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Cog
+class PromoSelection(discord.ui.Select):
+    def __init__(self, options: List[str], placeholder: str):
+        items = [discord.SelectOption(label=n.title(), value=n) for n in options]
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=items)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.selected = self.values[0]
+        await interaction.response.defer()
+        self.view.stop()
 
 
-class MatchCog(commands.Cog):
+class PromoView(discord.ui.View):
+    def __init__(self, names: List[str], placeholder: str):
+        super().__init__(timeout=60)
+        self.selected: Optional[str] = None
+        self.add_item(PromoSelection(names, placeholder))
+
+def _find_crowd_track() -> Optional[str]:
+    """Find a crowd ambience file in resolved music dir or common names."""
+    # explicit override if you have it in config
+    try:
+        from ..config import CROWD_AMBIENT
+        if CROWD_AMBIENT and os.path.exists(CROWD_AMBIENT):
+            return CROWD_AMBIENT
+    except Exception:
+        pass
+
+    music_dir = _resolve_music_dir()
+    candidates = [
+        music_dir / "ambient" / "crowd.mp3",
+        music_dir / "crowd.mp3",
+        music_dir / "crowd_ambience.mp3",
+        music_dir / "crowd.wav",
+        music_dir / "ambient" / "crowd.wav",
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
+
+def ensure_crowd_state(session: FightSession) -> None:
+    if not hasattr(session, "_crowd_seen_families"):
+        session._crowd_seen_families = set()
+    if not hasattr(session, "_crowd_last_line"):
+        session._crowd_last_line = ""
+    if not hasattr(session, "momentum"):
+        session.momentum = 0
+    if not hasattr(session, "crowd_hype"):
+        session.crowd_hype = 0
+
+async def _send_intro_with_ring(interaction: discord.Interaction, red, blue):
+    """Single Fight Night embed + short crowd ambience with fade-out."""
+    title = "🥊 Fight Night!"
+    desc = (
+        f"**In the Red Corner:** {red.name} — *{red.weight_class.title()}*\n"
+        f"_{red.intro or 'Ready to rumble.'}_\n\n"
+        f"**In the Blue Corner:** {blue.name} — *{blue.weight_class.title()}*\n"
+        f"_{blue.intro or 'No step backs.'}_"
+    )
+
+    emb = discord.Embed(title=title, description=desc, color=discord.Color.dark_gold())
+
+    # choose file or URL once
+    file_to_send = None
+    if os.path.exists(RING_GIF_LOCAL):
+        file_to_send = discord.File(RING_GIF_LOCAL, filename=os.path.basename(RING_GIF_LOCAL))
+        emb.set_image(url=f"attachment://{os.path.basename(RING_GIF_LOCAL)}")
+    else:
+        emb.set_image(url=RING_GIF_URL)
+
+    # ✅ send exactly once (NO second embed below)
+    if file_to_send:
+        await interaction.followup.send(embed=emb, file=file_to_send)
+    else:
+        await interaction.followup.send(embed=emb)
+
+    # crowd ambience (doesn't send another embed)
+    try:
+        vc = await ensure_voice(interaction)
+        if vc:
+            if vc.is_playing():
+                vc.stop()
+            crowd = _find_crowd_track()
+            if crowd and os.path.exists(crowd):
+                asyncio.create_task(_play_once(vc, crowd, seconds=12.0, fade_out=1.2))
+    except Exception as e:
+        print(f"[crowd sfx] failed: {e}")
+
+async def _send_matchup_gif_and_music(interaction: discord.Interaction, red, blue):
+    """Matchup GIF + optional voice intro clips."""
+    # GIF
+    mkey = ("MM" if red.gender == "male" and blue.gender == "male"
+            else "FF" if red.gender == "female" and blue.gender == "female"
+    else "MF")
+
+    emb = discord.Embed(
+        title="🎵 Fighter Intros",
+        description=f"{red.name} vs {blue.name}",
+        color=discord.Color.blurple(),
+    )
+
+    tracks = []
+    if getattr(red, "intro_music", None):
+        tracks.append(f"🔴 {red.name} — *{display_music_label(red.intro_music)}*")
+    if getattr(blue, "intro_music", None):
+        tracks.append(f"🔵 {blue.name} — *{display_music_label(blue.intro_music)}*")
+    if tracks:
+        emb.add_field(name="Tracks", value="\n".join(tracks), inline=False)
+
+    file_to_send = None
+    local_path = ROUND_GIF_LOCAL.get(mkey)
+    url = ROUND_GIF_URL.get(mkey)
+    if local_path and os.path.exists(local_path):
+        file_to_send = discord.File(local_path, filename=os.path.basename(local_path))
+        emb.set_image(url=f"attachment://{os.path.basename(local_path)}")
+    elif url:
+        emb.set_image(url=url)
+
+    if file_to_send:
+        await interaction.followup.send(embed=emb, file=file_to_send)
+    else:
+        await interaction.followup.send(embed=emb)
+
+    # Music
+    vc = await ensure_voice(interaction)
+    if vc:
+        if vc.is_playing():
+            vc.stop()
+        if getattr(red, "intro_music", None):
+            await play_clip(vc, red.intro_music, seconds=15)
+        if getattr(blue, "intro_music", None):
+            await play_clip(vc, blue.intro_music, seconds=15)
+
+
+# ----- Cog -----
+
+class Match(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    # Utility to play crowd ambience reliably
-    async def _play_crowd(self, interaction: discord.Interaction, seconds: int = 12):
-        # Try several crowd files
-        candidates = [
-            os.path.join(PROMO_MUSIC_DIR, "crowd.mp3"),
-            os.path.join(PROMO_MUSIC_DIR, "crowd.wav"),
-            os.path.join(PROMO_MUSIC_DIR, "crowd.ogg"),
-        ]
-        crowd = next((p for p in candidates if os.path.exists(p)), None)
-        try:
-            vc = await ensure_voice(interaction)
-            if crowd:
-                await play_clip(vc, crowd, seconds=seconds)
-                label = display_music_label(crowd)
-                await interaction.followup.send(f"🎵 Crowd ambience: {label} ({seconds}s clip)")
-        except Exception:
-            pass
+    @app_commands.command(
+        name="promo",
+        description="Set up a looping promo: pick fighters, show poster, and play promo music until /start."
+    )
+    async def promo(self, interaction: discord.Interaction):
+        from ..services.roster import list_boxers  # lazy import to avoid circulars
 
-    # Start command (select fighters, show ring gif, crowd ambience, intros, then start session)
-    @app_commands.command(name="start", description="Start Fight Night: pick fighters and start the show")
+        names = list_boxers()
+        if not names:
+            await interaction.response.send_message("No boxers yet. Use /boxer_create first.", ephemeral=True)
+            return
+
+        # Step 1: select fighter 1
+        await interaction.response.send_message("🎬 Choose the **first fighter** for the promo:", ephemeral=True)
+        v1 = PromoView(names, "Select fighter 1")
+        await interaction.edit_original_response(view=v1)
+        await v1.wait()
+        if not v1.selected:
+            await interaction.edit_original_response(content="❌ No selection made.", view=None)
+            return
+        first = v1.selected
+
+        # Step 2: select fighter 2
+        await interaction.edit_original_response(content="🎬 Choose the **second fighter** for the promo:", view=None)
+        v2 = PromoView([n for n in names if n != first], "Select fighter 2")
+        await interaction.edit_original_response(view=v2)
+        await v2.wait()
+        if not v2.selected:
+            await interaction.edit_original_response(content="❌ No selection made.", view=None)
+            return
+        second = v2.selected
+
+        # Build / choose art (centered text poster preferred)
+        img1 = _promo_image_for_name(first) or _promo_image_for_name(first.title())
+        img2 = _promo_image_for_name(second) or _promo_image_for_name(second.title())
+
+        poster = None
+        try:
+            poster = _render_promo_poster(first, second, img1, img2)
+        except Exception as e:
+            # log to console so you can see the real cause
+            print(f"[promo poster] render failed: {type(e).__name__}: {e}")
+
+        if not poster:
+            # graceful fallbacks – never crash the interaction
+            if img1 and img2:
+                try:
+                    poster = _compose_side_by_side(img1, img2)
+                except Exception as e:
+                    print(f"[promo poster] composite failed: {type(e).__name__}: {e}")
+            if not poster:
+                poster = img1 or img2
+
+        await interaction.edit_original_response(content="Building promo…", view=None)
+
+        emb = discord.Embed(color=discord.Color.gold())
+        if poster and os.path.exists(poster):
+            file_to_send = discord.File(poster, filename=os.path.basename(poster))
+            emb.set_image(url=f"attachment://{os.path.basename(poster)}")
+            await interaction.followup.send(embed=emb, file=file_to_send)
+        else:
+            emb.title = f"{first} VS {second}"
+            emb.add_field(name="Poster", value="No images found in `/graphics/promo/`.", inline=False)
+            await interaction.followup.send(embed=emb)
+
+        # === MUSIC LOOP (inside the function!) ===
+        music_dir = _resolve_music_dir()
+        track_path = _find_first_audio(music_dir)
+
+        if track_path:
+            vc = await _ensure_voice(interaction)
+            if not vc:
+                await interaction.followup.send(
+                    "🎵 Found music but I couldn't join voice. Check channel perms & FFMPEG_PATH.",
+                    ephemeral=True
+                )
+            else:
+                PROMO_ACTIVE[interaction.channel_id] = True
+                task = asyncio.create_task(_promo_music_loop(interaction, str(track_path)))
+                PROMO_TASKS[interaction.channel_id] = task
+                await interaction.followup.send(
+                    f"🎵 Looping `{Path(track_path).name}` from `{music_dir}`.",
+                    ephemeral=True
+                )
+        else:
+            listed = []
+            if music_dir.exists():
+                try:
+                    listed = sorted(os.listdir(music_dir))[:12]
+                except Exception:
+                    listed = ["<error listing directory>"]
+            await interaction.followup.send(
+                "🎵 No audio found.\n"
+                f"• PROMO_MUSIC_DIR (from config): `{PROMO_MUSIC_DIR}`\n"
+                f"• Resolved folder checked: `{music_dir}`\n"
+                f"• Looking for: {', '.join(ext.upper() for ext in AUDIO_EXTS)}\n"
+                f"• Top-level files found: {listed or '[none]'}\n"
+                "Tip: drop `hype.mp3` here to loop it.",
+                ephemeral=True
+            )
+
+    @app_commands.command(name="promo_music_test", description="Play first promo track once.")
+    async def promo_music_test(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        music_dir = _resolve_music_dir()
+        track = _find_first_audio(music_dir)
+        if not track:
+            return await interaction.followup.send(f"No audio in `{music_dir}`.", ephemeral=True)
+        vc = await _ensure_voice(interaction)
+        if not vc:
+            return await interaction.followup.send("Could not join voice.", ephemeral=True)
+        await _play_once(vc, str(track), seconds=4.0, fade_out=0.8)
+        from pathlib import Path as _P
+        await interaction.followup.send(f"Played: `{_P(track).name}`", ephemeral=True)
+
+    @app_commands.command(name="promo_stop", description="Stop any active promo loop & music in this channel.")
+    async def promo_stop(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=False, ephemeral=True)
+        await stop_promo_music(interaction)
+        await interaction.followup.send("🛑 Promo stopped in this channel.", ephemeral=True)
+
+    @app_commands.command(name="start", description="Pick two boxers, show ring + intros.")
     async def start(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=False, thinking=True)
-
-        channel_id = interaction.channel_id
-        if channel_id is None:
-            await interaction.followup.send("This command must be used from a channel.")
+        names = list_boxers()
+        if not names:
+            await interaction.response.send_message("No boxers available. Use `/boxer_create` first.", ephemeral=True)
             return
 
-        roster = list_boxers()
-        if len(roster) < 2:
-            await interaction.followup.send("Not enough fighters in roster.")
+        # stop promo loop if running in this channel
+        await stop_promo_music(interaction)
+
+        # Select fighters
+        await interaction.response.send_message("🎯 Choose the **first fighter**:", ephemeral=True)
+        from boxing_bot.ui.components import BoxerSelectionView  # lazy import to avoid cycles
+        view1 = BoxerSelectionView(names, "Select fighter 1")
+        await interaction.edit_original_response(view=view1)
+        await view1.wait()
+        if not view1.selected_boxer:
+            await interaction.edit_original_response(content="❌ No selection made.", view=None)
             return
-        red_key, blue_key = roster[0], roster[1]
-        red_raw = get_boxer(red_key)
-        blue_raw = get_boxer(blue_key)
-        if not red_raw or not blue_raw:
-            await interaction.followup.send("Failed to load fighters from the roster.")
+        first_name = view1.selected_boxer
+
+        await interaction.edit_original_response(content="🎯 Choose the **second fighter**:", view=None)
+        view2 = BoxerSelectionView([n for n in names if n != first_name], "Select fighter 2")
+        await interaction.edit_original_response(view=view2)
+        await view2.wait()
+        if not view2.selected_boxer:
+            await interaction.edit_original_response(content="❌ No selection made.", view=None)
             return
-
-        red_eff = effective_boxer(red_raw)
-        blue_eff = effective_boxer(blue_raw)
-
-        seed = random.randint(1, 1_000_000)
-        rng = random.Random(seed)
-        red_state = FighterState(boxer=red_eff, hp=red_eff.max_hp())
-        blue_state = FighterState(boxer=blue_eff, hp=blue_eff.max_hp())
-
-        session = FightSession(
-            channel_id=channel_id,
-            rng_seed=seed,
-            rng=rng,
-            red_raw=red_raw,
-            blue_raw=blue_raw,
-            red_eff=red_eff,
-            blue_eff=blue_eff,
-            A=red_state,
-            B=blue_state,
-        )
-
-        SESSIONS[channel_id] = session
-
-        matchup = corner_assignments(session.A, session.B)
-        gender_key = getattr(matchup, "gender_key", "MM")
-
-        def _select_asset(source: object) -> Optional[str]:
-            if isinstance(source, dict):
-                return source.get(gender_key)
-            if isinstance(source, str):
-                return source or None
-            return None
-
-        ring_gif = _select_asset(RING_GIF_LOCAL) or _select_asset(RING_GIF_URL)
-        red_wc = session.red_raw.weight_class.title()
-        blue_wc = session.blue_raw.weight_class.title()
-        em = discord.Embed(
-            title="🥊 Fight Night!",
-            description=(
-                f"**In the Red Corner:** {session.red_raw.name} — *{red_wc}*\n\n"
-                f"**In the Blue Corner:** {session.blue_raw.name} — *{blue_wc}*"
-            ),
-        )
-        if ring_gif:
-            em.set_image(url=ring_gif)
-        await interaction.followup.send(embed=em)
-
-        await self._play_crowd(interaction, seconds=12)
-
-        round_gif = _select_asset(ROUND_GIF_LOCAL) or _select_asset(ROUND_GIF_URL)
-        intro = discord.Embed(
-            title="Round 1 is coming up...",
-            description=f"{session.red_raw.name} and {session.blue_raw.name} make their way to center ring.",
-        )
-        if round_gif:
-            intro.set_image(url=round_gif)
-        await interaction.followup.send(embed=intro)
+        second_name = view2.selected_boxer
 
         try:
-            vc = await ensure_voice(interaction)
-            red_theme = getattr(session.red_raw, "intro_music", "") or getattr(session.red_raw, "theme", "")
-            blue_theme = getattr(session.blue_raw, "intro_music", "") or getattr(session.blue_raw, "theme", "")
-            if red_theme and os.path.exists(red_theme):
-                await play_clip(vc, red_theme, seconds=15)
-                label = display_music_label(red_theme)
-                await interaction.followup.send(f"🎵 {session.red_raw.name} theme: {label} (15s clip)")
-            if blue_theme and os.path.exists(blue_theme):
-                await play_clip(vc, blue_theme, seconds=15)
-                label = display_music_label(blue_theme)
-                await interaction.followup.send(f"🎵 {session.blue_raw.name} theme: {label} (15s clip)")
-        except Exception:
-            pass
+            A = get_boxer(first_name)
+            B = get_boxer(second_name)
+            if not A or not B:
+                await interaction.edit_original_response(content="❌ Could not load both fighters.", view=None)
+                return
 
-        await interaction.followup.send("Type `/fight` to roll Round 1.")
+            await interaction.edit_original_response(
+                content=f"✅ Fighters selected: **{first_name}** and **{second_name}**.\nSetting up the match...",
+                view=None,
+            )
 
-    # Fight command: revert to non-live batch of 6 exchanges (3 per boxer), then show summary + highlight/gif
-    @app_commands.command(name="fight", description="Run the next round (6 exchanges in one go).")
+            # Corner assignment + session build
+            rng = random.Random()
+            (red_info, blue_info) = corner_assignments(A, B, rng)
+            red_raw, blue_raw = red_info[1], blue_info[1]
+            red_eff, blue_eff = effective_boxer(red_raw), effective_boxer(blue_raw)
+
+            session = FightSession(
+                channel_id=interaction.channel_id,
+                rng_seed=None,
+                rng=rng,
+                red_raw=red_raw,
+                blue_raw=blue_raw,
+                red_eff=red_eff,
+                blue_eff=blue_eff,
+                A=FighterState(red_eff, red_eff.max_hp()),
+                B=FighterState(blue_eff, blue_eff.max_hp()),
+                kd_rule="per_round",
+                kd_limit=3,
+            )
+            SESSIONS[interaction.channel_id] = session
+
+            # Public confirmation
+            await interaction.followup.send(
+                f"Match set: **{red_raw.name} (Red)** vs **{blue_raw.name} (Blue)**.\nUse `/fight` to begin Round 1."
+            )
+
+            # Present intros — add a short cinematic delay
+            await _send_intro_with_ring(interaction, red_raw, blue_raw)
+
+            # Pause between the two cards
+            await asyncio.sleep(3.0)
+
+            # Stop ambience before intros begin (so they don’t overlap)
+
+
+            await _send_matchup_gif_and_music(interaction, red_raw, blue_raw)
+
+
+        except discord.Forbidden as e:
+            await interaction.followup.send(
+                f"❌ I don’t have permission to send messages/embeds here: `{e}`.\n"
+                f"Please grant **Send Messages**, **Embed Links**, and **Attach Files**.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            await interaction.followup.send(
+                f"⚠️ Error while creating the match: `{type(e).__name__}: {e}`",
+                ephemeral=True,
+            )
+            raise
+
+    @app_commands.command(name="fight", description="Begin Round 1 (then use /next_round).")
     async def fight(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=False, thinking=True)
+        await interaction.response.defer(thinking=True)
+        try:
+            s = SESSIONS.get(interaction.channel_id)
+            if not s:
+                await interaction.followup.send("No active match. Use `/start` first.")
+                return
+            if s.finished:
+                await interaction.followup.send(embed=self._summary_embed(s))
+                return
+            if s.current_round > 1 and s.log:
+                await interaction.followup.send("Fight already underway. Use `/next_round`.")
+                return
+
+            # in /fight:
+            _ensure_crowd_state(s)
+            _crowd_round_reset(s)
+
+            # play the round once
+            events, winner_type, loser = run_one_round(s)
+
+            # log it
+            s.log.append({
+                "round": s.current_round,
+                "events": events,
+                "hp": {s.A.boxer.name: s.A.hp, s.B.boxer.name: s.B.hp},
+            })
+
+            # instant commentary with 2s pacing
+            for ev in events:
+                crowd_line = await maybe_post_reaction_and_audio(interaction, s, ev)
+                await _send_exchange_note(interaction, s, ev, crowd_line=crowd_line)
+                await asyncio.sleep(2.0)
+
+            if winner_type:
+                s.winner_type = winner_type
+                if loser == s.A.boxer.name:
+                    s.winner, s.winner_corner = s.B.boxer.name, "Blue"
+                else:
+                    s.winner, s.winner_corner = s.A.boxer.name, "Red"
+                s.finished = True
+
+            await send_round_card(interaction, s, events)
+            s.momentum = 0  # reset for next round
+
+            if s.finished:
+                if s.winner_type == "Points":
+                    await send_points_decision(interaction, s)
+                else:
+                    loser_name = s.B.boxer.name if s.winner_corner == "Red" else s.A.boxer.name
+                    await send_finish_announcement(
+                        interaction, s.red_raw, s.blue_raw,
+                        s.winner, s.winner_corner, loser_name, s.winner_type
+                    )
+            else:
+                s.current_round += 1
+                await interaction.followup.send("Use `/next_round` to play the next round.")
+        except Exception as e:
+            await interaction.followup.send(f"⚠️ `/fight` crashed: `{type(e).__name__}: {e}`")
+            raise
+
+    @app_commands.command(name="next_round", description="Advance to the next round.")
+    async def next_round(self, interaction: discord.Interaction):
         s = SESSIONS.get(interaction.channel_id)
         if not s:
-            await interaction.followup.send("No active fight in this channel. Use `/start` first.")
+            await interaction.response.send_message("No active fight. Use `/start` then `/fight`.", ephemeral=True)
+            return
+        if s.finished:
+            await interaction.response.send_message(embed=self._summary_embed(s))
             return
 
-        total = s.exchanges_per_round if getattr(s, "exchanges_per_round", None) else 6
-        lines: List[str] = []
-        crowd_lines: List[str] = []
-        for i in range(1, total + 1):
-            atk = s.A if i % 2 == 1 else s.B
-            dfn = s.B if i % 2 == 1 else s.A
-            ev = attack_exchange(atk, dfn, s.rng)
-            # Build concise line
-            if ev.get("summary"):
-                lines.append(f"{i}. {ev['summary']}")
-            else:
-                # Generic fallback
-                outcome = ev.get("outcome", "exchange")
-                lines.append(f"{i}. ({outcome})")
-            # Crowd reaction
-            tag = ev.get("crowd_tag")
-            if tag and tag in CROWD_LINES:
-                crowd_lines.append(CROWD_LINES[tag].format(color="Red" if i % 2 == 1 else "Blue"))
-
-            if finalize_if_done(s):
-                break
-
-        if lines:
-            s.log.append({"round": s.current_round, "events": lines})
-        if crowd_lines:
-            s.crowd_log.extend(crowd_lines)
-
-        # Compose single round embed
-        title = f"Round {s.current_round}"
-        desc = "• " + "\n".join(lines) if lines else "—"
-        em = discord.Embed(title=title, description=desc)
-        em.add_field(name="Momentum", value=momentum_bar(s.momentum), inline=False)
-        em.add_field(
-            name=f"{s.A.boxer.name} (Red)  🟥",
-            value=_fighter_line(s.A, s.A.boxer.name, "🔴"),
-            inline=True,
-        )
-        em.add_field(
-            name=f"{s.B.boxer.name} (Blue) 🟦",
-            value=_fighter_line(s.B, s.B.boxer.name, "🔵"),
-            inline=True,
-        )
-        em.add_field(
-            name="Adrenaline",
-            value=(
-                f"🔴 {s.A.boxer.name}: {_bar(s.A.adrenaline)} {s.A.adrenaline}%\n"
-                f"🔵 {s.B.boxer.name}: {_bar(s.B.adrenaline)} {s.B.adrenaline}%"
-            ),
-            inline=False,
-        )
-
-        # Crowd reactions (if any)
-        if crowd_lines:
-            em.add_field(name="Crowd Reactions", value="\n".join(crowd_lines), inline=False)
-
-        await interaction.followup.send(embed=em)
-
-        # End-of-round highlight + GIF
-        await send_round_card(interaction, s)
-
-        # Finalize if KO/TKO/Points
-        if s.finished:
-            if (s.winner_type or "").upper() in {"KO", "TKO"}:
-                await send_finish_announcement(interaction, s)
-            else:
+        if s.current_round > 12:
+            finalize_if_done(s)
+            if s.finished and s.winner_type == "Points":
                 await send_points_decision(interaction, s)
+            else:
+                loser_name = s.B.boxer.name if s.winner_corner == "Red" else (
+                    s.A.boxer.name if s.winner_corner == "Blue" else None)
+                await send_finish_announcement(
+                    interaction, s.red_raw, s.blue_raw, s.winner, s.winner_corner, loser_name, s.winner_type
+                )
+            await interaction.followup.send(embed=self._summary_embed(s))
+            return
+
+        await interaction.response.defer(thinking=True)
+
+        # in /next_round:
+        _ensure_crowd_state(s)
+        _crowd_round_reset(s)
+
+        # play the round once
+        events, winner_type, loser = run_one_round(s)
+
+        # log it
+        s.log.append({
+            "round": s.current_round,
+            "events": events,
+            "hp": {s.A.boxer.name: s.A.hp, s.B.boxer.name: s.B.hp},
+        })
+
+        # instant commentary with 2s pacing
+        for ev in events:
+            crowd_line = await maybe_post_reaction_and_audio(interaction, s, ev)
+            await _send_exchange_note(interaction, s, ev, crowd_line=crowd_line)
+            await asyncio.sleep(2.0)
+
+        if winner_type:
+            s.winner_type = winner_type
+            if loser == s.A.boxer.name:
+                s.winner, s.winner_corner = s.B.boxer.name, "Blue"
+            else:
+                s.winner, s.winner_corner = s.A.boxer.name, "Red"
+            s.finished = True
+
+        await send_round_card(interaction, s, events)
+        s.momentum = 0  # reset for next round
+
+        if s.finished:
+            if s.winner_type == "Points":
+                await send_points_decision(interaction, s)
+            else:
+                loser_name = s.B.boxer.name if s.winner_corner == "Red" else s.A.boxer.name
+                await send_finish_announcement(
+                    interaction, s.red_raw, s.blue_raw, s.winner, s.winner_corner, loser_name, s.winner_type
+                )
         else:
             s.current_round += 1
+            if s.current_round > 12:
+                finalize_if_done(s)
+                if s.finished and s.winner_type == "Points":
+                    await send_points_decision(interaction, s)
+                else:
+                    loser_name = s.B.boxer.name if s.winner_corner == "Red" else (
+                        s.A.boxer.name if s.winner_corner == "Blue" else None)
+                    await send_finish_announcement(
+                        interaction, s.red_raw, s.blue_raw, s.winner, s.winner_corner, loser_name, s.winner_type
+                    )
+                await interaction.followup.send(embed=self._summary_embed(s))
+            else:
+                await interaction.followup.send(
+                    f"Round {s.current_round - 1} complete. Use `/next_round` for Round {s.current_round}."
+                )
+
+    @app_commands.command(name="resolve_test", description="(TEST) Force-resolve the current fight.")
+    @app_commands.describe(method="KO | TKO | Points", winner="Red | Blue")
+    @app_commands.choices(
+        method=[
+            app_commands.Choice(name="KO", value="KO"),
+            app_commands.Choice(name="TKO", value="TKO"),
+            app_commands.Choice(name="Points", value="Points"),
+        ],
+        winner=[
+            app_commands.Choice(name="Red", value="Red"),
+            app_commands.Choice(name="Blue", value="Blue"),
+        ],
+    )
+    async def resolve_test(
+            self,
+            interaction: discord.Interaction,
+            method: app_commands.Choice[str],
+            winner: app_commands.Choice[str],
+    ):
+        s = SESSIONS.get(interaction.channel_id)
+        if not s:
+            await interaction.response.send_message("No active match.", ephemeral=True)
+            return
+        if s.finished:
+            await interaction.response.send_message("This fight is already finished.", ephemeral=True)
+            return
+
+        await interaction.response.defer(thinking=False)
+        if winner.value == "Red":
+            s.winner, s.winner_corner, loser_name = s.A.boxer.name, "Red", s.B.boxer.name
+        else:
+            s.winner, s.winner_corner, loser_name = s.B.boxer.name, "Blue", s.A.boxer.name
+
+        s.winner_type = method.value
+        s.finished = True
+
+        if method.value == "Points":
+            if not getattr(s, "judge_cards", None):
+                from ..services.combat import compute_scorecards
+                s.judge_cards = compute_scorecards(s)
+            await send_points_decision(interaction, s)
+        else:
+            await send_finish_announcement(
+                interaction, s.red_raw, s.blue_raw, s.winner, s.winner_corner, loser_name, s.winner_type
+            )
+
+    # helper as an instance method (since you call self._summary_embed)
+    def _summary_embed(self, s: FightSession) -> discord.Embed:
+        if s.winner and s.winner_type:
+            desc = f"{s.winner} wins by {s.winner_type}!"
+        elif s.finished and not s.winner:
+            desc = "Draw after 12 rounds."
+        else:
+            desc = f"Fight in progress — Round {s.current_round} next."
+        e = discord.Embed(title="Fight Status", description=desc, color=discord.Color.gold())
+        e.add_field(name=f"🔴 {s.A.boxer.name} (Red)", value=f"HP: **{max(0, s.A.hp)}**", inline=True)
+        e.add_field(name=f"🔵 {s.B.boxer.name} (Blue)", value=f"HP: **{max(0, s.B.hp)}**", inline=True)
+        return e
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(MatchCog(bot))
+    await bot.add_cog(Match(bot))

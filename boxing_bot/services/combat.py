@@ -3,7 +3,6 @@ import asyncio
 import random
 import discord
 from typing import Tuple, List, Dict, Optional
-from dataclasses import dataclass
 from ..models import FightSession, Boxer, FighterState, gender_badge
 from ..config import (
     ROUND_GIF_LOCAL, ROUND_GIF_URL,
@@ -12,17 +11,26 @@ from ..config import (
     JUDGE_CARD_PNG_LOCAL, JUDGE_CARD_PNG_URL,
     MOMENTUM_MAX, MOMENTUM_HIT_GAIN, MOMENTUM_BIG_HIT_BONUS, MOMENTUM_KD_BONUS,
     MOMENTUM_BLOCKED_PENALTY, MOMENTUM_CRITMISS_SWING, MOMENTUM_LOW_BLOW_SWING,
-    CROWD_REACTIONS, COMMENTARY_DIR,
+    CROWD_REACTIONS, COMMENTARY_DIR, MUSIC_DIR, PROMO_MUSIC_DIR
 )
 from ..services.voice import ensure_voice, play_clip
 from .presentation import momentum_bar
 
 # === helpers from your code (mods, hit tables, etc.) ===
 
-def _ensure_crowd_state(session, *_):
-    """Ensure per-round crowd state attrs exist on the session; ignore extra args."""
-    if not hasattr(session, "_crowd_seen_families"):
-        session._crowd_seen_families = set()
+def _pick_commentary_line():
+    # example: pick a random .txt file from commentary lines folder
+    files = [f for f in os.listdir(COMMENTARY_DIR) if f.lower().endswith(".txt")]
+    if not files:
+        return None
+    chosen = random.choice(files)
+    with open(os.path.join(COMMENTARY_DIR, chosen), "r", encoding="utf-8") as fh:
+        return fh.read().strip()
+
+def _ensure_crowd_state(session: FightSession, *_, **__):
+    """Per-fight/round crowd state (tolerates extra args from older callers)."""
+    if not hasattr(session, "_crowd_seen_keys"):
+        session._crowd_seen_keys = set()
     if not hasattr(session, "_crowd_last_line"):
         session._crowd_last_line = ""
     if not hasattr(session, "momentum"):
@@ -30,13 +38,33 @@ def _ensure_crowd_state(session, *_):
     if not hasattr(session, "crowd_hype"):
         session.crowd_hype = 0
 
-def _crowd_round_reset(s):
-    """Call at the start of each round to allow new crowd reactions."""
-    _ensure_crowd_state(s)
-    s._crowd_seen_keys.clear()
-    s._crowd_round += 1
+def _crowd_round_reset(session: FightSession):
+    _ensure_crowd_state(session)
+    session._crowd_seen_keys = set()
+    session._crowd_last_line = ""
 
+def _find_cheer_clip() -> Optional[str]:
+    """
+    Prefer COMMENTARY_DIR/cheer.mp3, else look in promo music folders.
+    """
+    try_candidates = []
+    if os.path.isdir(COMMENTARY_DIR):
+        try_candidates.append(os.path.join(COMMENTARY_DIR, "cheer.mp3"))
+        try_candidates.append(os.path.join(COMMENTARY_DIR, "cheer.wav"))
 
+    # Soft fallback to graphics/promo/music if you use that layout
+    promo_roots = [
+        os.path.join(os.getcwd(), "graphics", "promo", "music"),
+        os.path.join(os.getcwd(), "graphics", "promo")
+    ]
+    for root in promo_roots:
+        try_candidates.append(os.path.join(root, "cheer.mp3"))
+        try_candidates.append(os.path.join(root, "cheer.wav"))
+
+    for p in try_candidates:
+        if os.path.exists(p):
+            return p
+    return None
 
 # ⬇️ helper: which corner is this fighter in?
 def _corner_of(session: FightSession, name: str) -> str:
@@ -249,23 +277,46 @@ def resolve_commentary_mp3(key: str, session: FightSession, ev: dict) -> Optiona
         return _exists(f"{a_corner}_Momentum.mp3") or _exists(f"{a_corner}_Pressure.mp3")
     return None
 
-# Per-round anti-spam (use on the session)
-def _crowd_round_reset(s: FightSession):
-    s._crowd_seen_keys = set()
-    s._crowd_last_line = ""
-
 async def maybe_post_reaction_and_audio(
     interaction: discord.Interaction,
     session: FightSession,
     ev: dict
 ) -> Optional[str]:
     key = detect_reaction_key(session, ev)
+
+    # ── New: “two whiffs then dull event” crowd line ─────────────────────
     if not key:
+        # Did the previous TWO exchanges both miss?
+        recent = getattr(session, "_last_two_outcomes", [])
+        oc = ev.get("outcome")
+
+        had_two_misses = (
+            len(recent) == 2
+            and all(o in ("miss", "critical_miss") for o in recent)
+        )
+
+        # What counts as the follow-up “dull” event?
+        is_another_miss = oc in ("miss", "critical_miss")
+        is_small_hit = (
+            oc == "hit"
+            and (ev.get("hit_type") or "").lower() in ("jab", "hook", "glancing")
+            and ev.get("damage", 0) <= 8
+        )
+
+        # Only fire once per round
+        seen = getattr(session, "_crowd_seen_keys", set())
+        if had_two_misses and (is_another_miss or is_small_hit) and "miss_streak" not in seen:
+            line = random.choice([
+                "🎙️ **Crowd**: Lot of air in there — someone needs to find the target.",
+                "🎙️ **Crowd**: They’re fencing with shadows… arena wants leather on chin.",
+                "🎙️ **Crowd**: After all those whiffs, even a jab gets a little cheer."
+            ])
+            await interaction.followup.send(line)
+            seen.add("miss_streak")
+            session._crowd_seen_keys = seen
         return None
-    # per-round cooldown: one instance of each key per round
-    seen = getattr(session, "_crowd_seen_keys", set())
-    if key in seen:
-        return None
+    # ── End new block ─────────────────────────────────────────────────────
+
 
     line = format_reaction_line(key, session, ev)
     # avoid immediate repeat
@@ -289,12 +340,37 @@ async def maybe_post_reaction_and_audio(
                 if vc:
                     if vc.is_playing(): vc.stop()
                     # short + snappy
-                    await play_clip(vc, mp3, seconds=3)
+                    await play_clip(vc, mp3, seconds=5)
                     await asyncio.sleep(0.05)
             except Exception as e:
                 print(f"[commentary] {type(e).__name__}: {e}")
 
     return line
+
+async def maybe_post_lull(interaction: discord.Interaction, session: FightSession):
+    """When exchanges are dull, nudge the crowd once per round."""
+    _ensure_crowd_state(session)
+    key = f"r{session.current_round}_lull_mid"
+    if key in session._crowd_seen_keys:
+        return
+    # only if hype is low
+    if getattr(session, "crowd_hype", 0) < 40 and getattr(session, "_quiet_streak", 0) >= 3:
+        line = random.choice([
+            "Crowd getting a bit restless — someone needs to let the hands go.",
+            "It’s a chess match out there… the arena wants action.",
+            "Muted buzz in the seats — both corners waiting for a mistake."
+        ])
+        session._crowd_seen_keys.add(key)
+        await interaction.followup.send(f"🎙️ **Crowd**: {line}")
+        # optional soft murmur SFX if present
+        try:
+            murmur = _exists("Crowd_Murmur.mp3") or _exists("Crowd_Murmur.wav")
+            if murmur:
+                vc = await ensure_voice(interaction)
+                if vc:
+                    await play_clip(vc, murmur, seconds=5)
+        except Exception:
+            pass
 
 async def maybe_post_crowd_reaction(
     interaction: discord.Interaction,
@@ -302,7 +378,7 @@ async def maybe_post_crowd_reaction(
     round_idx: int,
     events: list[dict]
 ):
-    _ensure_crowd_state(session, round_idx)
+    _ensure_crowd_state(session)
 
     # Signals
     had_kd      = any(e.get("knockdown") for e in events if e.get("outcome") == "hit")
@@ -641,42 +717,118 @@ def corner_assignments(a: Boxer, b: Boxer, rng: random.Random):
     return (("Red", a), ("Blue", b)) if rng.randint(0,1)==0 else (("Red", b), ("Blue", a))
 
 def _highlight_gif_for_event(session: FightSession, ev: dict):
-    mkey = matchup_key(session.red_raw, session.blue_raw)
+    from pathlib import Path
+    mkey = matchup_key(session.red_raw, session.blue_raw)  # "MM","FF","MF"
     attacker = ev.get("attacker")
     corner = "Red" if attacker == session.A.boxer.name else "Blue"
-    hit_type = (ev.get("hit_type") or ev.get("outcome") or "glancing").lower()
-    if hit_type not in {"glancing","jab","cross","hook","uppercut","miss","low_blow"}:
-        hit_type = "glancing"
-    key = (mkey, corner, hit_type)
+
+    # Normalize type
+    alias = {
+        "glancing": "glancing",
+        "jab": "jab",
+        "cross": "cross",
+        "straight": "cross",   # straight -> cross
+        "hook": "hook",
+        "uppercut": "uppercut",
+        "miss": "miss",
+        "critical_miss": "miss",
+        "low_blow": "low_blow",
+        "knockdown": "knockdown",
+    }
+    raw_type = (ev.get("gif_type") or ev.get("hit_type") or ev.get("outcome") or "glancing").lower()
+    gif_type = alias.get(raw_type, "glancing")
+
+    # 1) Try filename convention directly (works even if config maps are empty)
+    #    e.g. graphics/promo/rounds/mm_red_hook.gif
+    rounds_dir = Path(os.getcwd()) / "graphics" / "promo" / "rounds"
+    fname = f"{mkey.lower()}_{corner.lower()}_{gif_type}.gif"
+    fpath = rounds_dir / fname
+    if fpath.exists():
+        return discord.File(str(fpath), filename=fpath.name), None
+
+    # 2) Your configured maps (keys must be EXACT: ("MM","Red","hook"))
+    key = (mkey, corner, gif_type)
     local = ROUND_HIGHLIGHT_GIF_LOCAL.get(key)
     if local and os.path.exists(local):
         return discord.File(local, filename=os.path.basename(local)), None
     url = ROUND_HIGHLIGHT_GIF_URL.get(key)
-    if url: return None, url
-    for k,p in ROUND_HIGHLIGHT_GIF_LOCAL.items():
-        if k[0]==mkey and k[1]==corner and os.path.exists(p):
+    if url:
+        return None, url
+
+    # 3) Corner-only fallback within rounds_dir (any type for same matchup/corner)
+    if rounds_dir.exists():
+        for alt in rounds_dir.glob(f"{mkey.lower()}_{corner.lower()}_*.gif"):
+            return discord.File(str(alt), filename=alt.name), None
+
+    # 4) Map fallbacks for same matchup/corner
+    for k, p in ROUND_HIGHLIGHT_GIF_LOCAL.items():
+        if k[0] == mkey and k[1] == corner and os.path.exists(p):
             return discord.File(p, filename=os.path.basename(p)), None
-    for k,u in ROUND_HIGHLIGHT_GIF_URL.items():
-        if k[0]==mkey and k[1]==corner:
+    for k, u in ROUND_HIGHLIGHT_GIF_URL.items():
+        if k[0] == mkey and k[1] == corner:
             return None, u
+
+    # 5) Generic round art
     local_generic = ROUND_GIF_LOCAL.get(mkey)
     if local_generic and os.path.exists(local_generic):
         return discord.File(local_generic, filename=os.path.basename(local_generic)), None
     url_generic = ROUND_GIF_URL.get(mkey)
-    if url_generic: return None, url_generic
+    if url_generic:
+        return None, url_generic
     return None, None
 
+
+def _finish_gif_for_result(red: Boxer, blue: Boxer, winner_corner: str, win_type: str):
+    """
+    Pick the correct finish GIF file based on matchup, corner, and result.
+    Looks in graphics/promo/finish/ for files like:
+        mm_red_ko.gif
+        mm_blue_tko.gif
+        mm_red_points.gif
+    Returns (discord.File | None, url | None)
+    """
+    from pathlib import Path
+    import os
+    mkey = matchup_key(red, blue)  # e.g., "MM", "FF", "MF"
+    base_dir = Path(os.getcwd()) / "graphics" / "promo" / "finish"
+    file_to_send = None
+    url = None
+
+    if not base_dir.exists():
+        return None, None
+
+    fn = f"{mkey.lower()}_{winner_corner.lower()}_{win_type.lower()}.gif"
+    p = base_dir / fn
+    if p.exists():
+        return discord.File(str(p), filename=p.name), None
+
+    # fallback: look for partial matches (e.g., mm_red_ko*.gif)
+    for alt in base_dir.glob(f"{mkey.lower()}_{winner_corner.lower()}_{win_type.lower()}*.gif"):
+        return discord.File(str(alt), filename=alt.name), None
+
+    # final fallback: generic
+    for alt in base_dir.glob(f"{mkey.lower()}_*_{win_type.lower()}*.gif"):
+        return discord.File(str(alt), filename=alt.name), None
+
+    return None, None
+
+
 def run_one_round(session: FightSession) -> Tuple[List[dict], Optional[str], Optional[str]]:
+    # stamina recovery at start of round
     recovA = 2 + (session.A.boxer.stamina // 20)
     recovB = 2 + (session.B.boxer.stamina // 20)
     session.A.fatigue = max(0, session.A.fatigue - recovA)
     session.B.fatigue = max(0, session.B.fatigue - recovB)
 
+    # round KD counters
     session.kd_round = {"A": 0, "B": 0}
 
-    events = []
-    loser = None
-    winner_type = None
+    events: List[dict] = []
+    loser: Optional[str] = None
+    winner_type: Optional[str] = None
+
+    if not hasattr(session, "kd_total"):
+        session.kd_total = {"A": 0, "B": 0}
 
     order = [("A","B"),("B","A"),("A","B"),("B","A"),("A","B"),("B","A")]
     for attacker, defender in order:
@@ -686,26 +838,56 @@ def run_one_round(session: FightSession) -> Tuple[List[dict], Optional[str], Opt
             update_adrenaline(session.A, session.B, ev)
             update_momentum(session, ev)
             ev["crowd_tags"] = _crowd_tags_for_event(session, ev)
+
+            # quiet streak for later lull logic (used by maybe_post_lull in your cog)
+            if ev.get("outcome") in ("miss", "critical_miss"):
+                session._quiet_streak = getattr(session, "_quiet_streak", 0) + 1
+            else:
+                session._quiet_streak = 0
+            # track last two outcomes for “double-miss then dull event” commentary
+            recent = getattr(session, "_last_two_outcomes", [])
+            recent.append(ev.get("outcome"))
+            if len(recent) > 2:
+                recent = recent[-2:]
+            session._last_two_outcomes = recent
+
+
             if ev.get("knockdown"):
                 session.kd_round["B"] += 1
                 session.kd_total["B"] += 1
                 session.B.off_balance_penalty -= 1
+
             if session.B.hp <= 0:
-                winner_type = "KO"; loser = session.B.boxer.name; break
+                winner_type, loser = "KO", session.B.boxer.name
+                break
         else:
             ev = attack_exchange(session.B, session.A, session.rng)
             events.append(ev)
             update_adrenaline(session.B, session.A, ev)
             update_momentum(session, ev)
             ev["crowd_tags"] = _crowd_tags_for_event(session, ev)
+
+            if ev.get("outcome") in ("miss", "critical_miss"):
+                session._quiet_streak = getattr(session, "_quiet_streak", 0) + 1
+            else:
+                session._quiet_streak = 0
+            # ✅ track last two outcomes for “double-miss then dull event” commentary
+            recent = getattr(session, "_last_two_outcomes", [])
+            recent.append(ev.get("outcome"))
+            if len(recent) > 2:
+                recent = recent[-2:]
+            session._last_two_outcomes = recent
+
             if ev.get("knockdown"):
                 session.kd_round["A"] += 1
                 session.kd_total["A"] += 1
                 session.A.off_balance_penalty -= 1
-            if session.A.hp <= 0:
-                winner_type = "KO"; loser = session.A.boxer.name; break
 
-    # 3KD rule (if enabled)
+            if session.A.hp <= 0:
+                winner_type, loser = "KO", session.A.boxer.name
+                break
+
+    # 3KD rule
     if winner_type is None and session.kd_rule != "off":
         kdr_A = session.kd_round["A"] if session.kd_rule == "per_round" else session.kd_total["A"]
         kdr_B = session.kd_round["B"] if session.kd_rule == "per_round" else session.kd_total["B"]
@@ -726,15 +908,17 @@ def run_one_round(session: FightSession) -> Tuple[List[dict], Optional[str], Opt
         elif kdr_B >= session.kd_limit:
             winner_type, loser = "TKO", session.B.boxer.name
 
+    # damage-based TKO check
     if not winner_type:
         dmgA = round_damage(events, session.A.boxer.name)
         dmgB = round_damage(events, session.B.boxer.name)
         if tko_stoppage(session.A.hp, dmgA):
-            winner_type = "TKO"; loser = session.A.boxer.name
+            winner_type, loser = "TKO", session.A.boxer.name
         elif tko_stoppage(session.B.hp, dmgB):
-            winner_type = "TKO"; loser = session.B.boxer.name
+            winner_type, loser = "TKO", session.B.boxer.name
 
     return events, winner_type, loser
+
 
 def finalize_if_done(session: FightSession):
     if session.finished: return
@@ -836,6 +1020,7 @@ def compute_scorecards(session: FightSession) -> list[dict]:
 
 async def send_finish_announcement(
     interaction: discord.Interaction,
+    session: FightSession,
     red: Boxer,
     blue: Boxer,
     winner_name: Optional[str],
@@ -850,6 +1035,7 @@ async def send_finish_announcement(
             color=discord.Color.dark_grey()
         )
         await interaction.followup.send(embed=emb)
+        # optional: mild crowd murmur instead of cheer
         return
 
     title = f"🏁 Result: {winner_name} wins by {win_type}!"
@@ -860,16 +1046,133 @@ async def send_finish_announcement(
         color=color
     )
 
+    # 👇 NEW: add stat lines under the title
+    totals = _fight_totals(session) if hasattr(interaction, "client") and hasattr(interaction, "channel") else None
+    try:
+        if totals:
+            rname, bname = red.name, blue.name
+            rt = totals.get(rname, {})
+            bt = totals.get(bname, {})
+            r_txt = (
+                f"**Landed/Thrown:** {rt.get('landed', 0)}/{rt.get('thrown', 0)} "
+                f"({rt.get('accuracy', 0):.0f}%)\n"
+                f"**Damage:** {rt.get('damage', 0)}  •  **KD For/Against:** {rt.get('kd_for', 0)}/{rt.get('kd_against', 0)}\n"
+                f"**Blocks Forced:** {rt.get('blocks_forced', 0)}  •  **Fouls (warnings):** {rt.get('fouls', 0)}"
+            )
+            b_txt = (
+                f"**Landed/Thrown:** {bt.get('landed', 0)}/{bt.get('thrown', 0)} "
+                f"({bt.get('accuracy', 0):.0f}%)\n"
+                f"**Damage:** {bt.get('damage', 0)}  •  **KD For/Against:** {bt.get('kd_for', 0)}/{bt.get('kd_against', 0)}\n"
+                f"**Blocks Forced:** {bt.get('blocks_forced', 0)}  •  **Fouls (warnings):** {bt.get('fouls', 0)}"
+            )
+            emb.add_field(name=f"🔴 {red.name}", value=r_txt, inline=False)
+            emb.add_field(name=f"🔵 {blue.name}", value=b_txt, inline=False)
+    except Exception:
+        # don’t block the result if anything goes weird
+        pass
+
     mkey = matchup_key(red, blue)
     key = (mkey, winner_corner, win_type)
     file_to_send = None
     local_path = FINISH_GIF_LOCAL.get(key)
     url = FINISH_GIF_URL.get(key)
-    if local_path and os.path.exists(local_path):
-        file_to_send = discord.File(local_path, filename=os.path.basename(local_path))
-        emb.set_image(url=f"attachment://{os.path.basename(local_path)}")
+
+    # 🎞️ finish GIF
+    file_to_send, url = _finish_gif_for_result(red, blue, winner_corner, win_type)
+
+    if file_to_send:
+        emb.set_image(url=f"attachment://{file_to_send.filename}")
+        await interaction.followup.send(embed=emb, file=file_to_send)
     elif url:
         emb.set_image(url=url)
+        await interaction.followup.send(embed=emb)
+    else:
+        # fallback to no image
+        await interaction.followup.send(embed=emb)
+
+    # 🔔 Bell + 🎉 Cheer sequence on finish
+    try:
+        bell = _find_bell_clip()
+        if bell:
+            vc = await ensure_voice(interaction)
+            if vc:
+                if vc.is_playing():
+                    vc.stop()
+                # 1) Bell rings cleanly
+                await play_clip(vc, bell, seconds=3)
+                # short pause before cheer (optional)
+                await asyncio.sleep(0.3)
+
+        clip = _find_cheer_clip()
+        if clip:
+            vc = await ensure_voice(interaction)
+            if vc:
+                if vc.is_playing():
+                    vc.stop()
+                # 2) Play cheer afterwards
+                await play_clip(vc, clip, seconds=5)
+                await asyncio.sleep(0.05)
+    except Exception as _e:
+        print(f"[bell/cheer] {type(_e).__name__}: {_e}")
+        pass
+
+def _fight_totals(session: FightSession) -> dict[str, dict]:
+    """Return {name: {landed, thrown, accuracy, damage, kd_for, kd_against, blocks_forced, fouls}}."""
+    nameA, nameB = session.A.boxer.name, session.B.boxer.name
+    out = {
+        nameA: {"landed":0,"thrown":0,"damage":0,"kd_for":0,"kd_against":0,"blocks_forced":0,"fouls":session.A.warnings},
+        nameB: {"landed":0,"thrown":0,"damage":0,"kd_for":0,"kd_against":0,"blocks_forced":0,"fouls":session.B.warnings},
+    }
+    for rnd in session.log:
+        for e in rnd.get("events", []):
+            oc = e.get("outcome")
+            atk, dfn = e.get("attacker"), e.get("defender")
+            # attempts
+            if oc in ("hit","miss","critical_miss","low_blow"):
+                out[atk]["thrown"] += 1
+            # landed
+            if oc == "hit":
+                out[atk]["landed"] += 1
+                out[atk]["damage"] += int(e.get("damage",0))
+                if e.get("knockdown"):
+                    out[atk]["kd_for"] += 1
+                    out[dfn]["kd_against"] += 1
+                if e.get("blocked") and e.get("block_success") is True:
+                    out[atk]["blocks_forced"] += 1
+            elif oc == "low_blow":
+                # we still count as an attempt; fouls already tracked via warnings
+                pass
+    for name, d in out.items():
+        d["accuracy"] = (100.0 * d["landed"] / d["thrown"]) if d["thrown"] else 0.0
+    return out
+
+
+def _find_bell_clip() -> Optional[str]:
+    """
+    Prefer Bell.mp3 / Bell.wav in COMMENTARY_DIR, fallback to promo music folder.
+    """
+    try_candidates = []
+    if os.path.isdir(COMMENTARY_DIR):
+        try_candidates += [
+            os.path.join(COMMENTARY_DIR, "Bell.mp3"),
+            os.path.join(COMMENTARY_DIR, "Bell.wav"),
+        ]
+
+    promo_roots = [
+        os.path.join(os.getcwd(), "graphics", "promo", "music"),
+        os.path.join(os.getcwd(), "graphics", "promo"),
+    ]
+    for root in promo_roots:
+        try_candidates += [
+            os.path.join(root, "Bell.mp3"),
+            os.path.join(root, "Bell.wav"),
+        ]
+
+    for p in try_candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
 
 def _resolve_judge_card_asset(badge_key: str, judge_name: str) -> tuple[Optional[str], Optional[str]]:
     """
@@ -939,13 +1242,12 @@ async def send_points_decision(interaction: discord.Interaction, session: FightS
     loser_name = session.B.boxer.name if session.winner_corner == "Red" else (session.A.boxer.name if session.winner_corner == "Blue" else None)
     await send_finish_announcement(
         interaction,
+        session,
         session.red_raw, session.blue_raw,
         session.winner, session.winner_corner,
         loser_name,
         "Points"
     )
-
-
 
 # ===================== Round card + finish announcement =====================
 def _bar(val: int, width: int = 12, fill: str = "█", empty: str = "—") -> str:
@@ -1050,19 +1352,6 @@ async def send_round_card(interaction: discord.Interaction, session: FightSessio
     file_to_send: Optional[discord.File] = None
     url: Optional[str] = None
 
-    # send embed as you already do…
-    if file_to_send:
-        attach_name = os.path.basename(file_to_send.fp.name)
-        emb.set_image(url=f"attachment://{attach_name}")
-        await interaction.followup.send(embed=emb, file=file_to_send)
-    else:
-        if url:
-            emb.set_image(url=url)
-        await interaction.followup.send(embed=emb)
-
-    # NEW: post a flavour reaction
-    await maybe_post_crowd_reaction(interaction, session, session.current_round, round_events)
-
     active_specs = []
     if session.A.special_name:
         active_specs.append(f"🔴 {session.A.boxer.name}: {session.A.special_name} ({session.A.special_turns})")
@@ -1083,7 +1372,8 @@ async def send_round_card(interaction: discord.Interaction, session: FightSessio
         inline=False
     )
 
-    # Highlight selection (unchanged from your logic)...
+    # ---- Highlight selection ----
+    highlight_ev = None
     hits = [e for e in round_events if e.get("outcome") == "hit"]
     low_blows = [e for e in round_events if e.get("outcome") == "low_blow"]
     misses = [e for e in round_events if e.get("outcome") == "miss"]
@@ -1091,12 +1381,15 @@ async def send_round_card(interaction: discord.Interaction, session: FightSessio
 
     if hits:
         highlight_ev = max(hits, key=lambda e: e.get("damage", 0))
-        title = f"{highlight_ev['attacker']} lands a {highlight_ev['hit_type']}!"
-        desc = f"→ {highlight_ev['defender']} for **{highlight_ev['damage']}** to {highlight_ev['location']}"
-        # put highlight at the TOP to guarantee visibility
+        # If it produced a KD, force KD art
+        if highlight_ev.get("knockdown"):
+            highlight_ev = dict(highlight_ev)
+            highlight_ev["gif_type"] = "knockdown"
+        title = f"{highlight_ev['attacker']} lands a {highlight_ev.get('hit_type', 'shot')}!"
+        desc = f"→ {highlight_ev['defender']} for **{highlight_ev.get('damage', 0)}** to {highlight_ev.get('location', 'head')}"
         emb.insert_field_at(0, name="Round Highlight", value=f"{title}\n{desc}", inline=False)
     elif low_blows:
-        highlight_ev = dict(low_blows[0], hit_type="low_blow")
+        highlight_ev = dict(low_blows[0], gif_type="low_blow", hit_type="low_blow")
         emb.insert_field_at(0, name="Round Highlight", value=f"{highlight_ev['attacker']} goes LOW — warning!",
                             inline=False)
     elif misses:
@@ -1110,17 +1403,8 @@ async def send_round_card(interaction: discord.Interaction, session: FightSessio
     else:
         emb.insert_field_at(0, name="Round Highlight", value="Cagey exchanges.", inline=False)
 
-        # Prefer per-event highlight (includes miss/low_blow if you added art)
-        chosen_ev = None
-        if hits:
-            chosen_ev = max(hits, key=lambda e: e.get("damage", 0))
-        else:
-            # allow miss / low_blow themed gifs to show sometimes
-            fouls = [e for e in round_events if e.get("outcome") == "low_blow"]
-            misses = [e for e in round_events if e.get("outcome") in ("miss", "critical_miss")]
-            chosen_ev = (fouls[0] if fouls else (misses[0] if misses else None))
-
-        file_to_send = None
+    # Route to a GIF (jab/cross/straight/hook/uppercut/miss/low_blow/knockdown supported)
+    file_to_send = None
     url = None
     if highlight_ev:
         file_to_send, url = _highlight_gif_for_event(session, highlight_ev)
@@ -1142,11 +1426,4 @@ async def send_round_card(interaction: discord.Interaction, session: FightSessio
         if url:
             emb.set_image(url=url)
         await interaction.followup.send(embed=emb)
-
-        # Optional: crowd flavour (guarded)
-    try:
         await maybe_post_crowd_reaction(interaction, session, session.current_round, round_events)
-    except Exception as _e:
-        # keep fight flow alive even if flavour fails
-        pass
-

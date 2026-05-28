@@ -14,13 +14,14 @@ from ..services.stats import effective_boxer
 from ..services.combat import (
     corner_assignments,
     run_one_round,
+    _crowd_round_reset,
+    _ensure_crowd_state,
+    maybe_post_reaction_and_audio,
     finalize_if_done,
     send_round_card,
     send_points_decision,
     send_finish_announcement,
-    _crowd_round_reset,
-    _ensure_crowd_state,
-    maybe_post_reaction_and_audio,
+    maybe_post_crowd_reaction,
 )
 from ..services.presentation import momentum_bar
 
@@ -31,9 +32,9 @@ from ..config import (
     RING_GIF_LOCAL,
     RING_GIF_URL,
     ROUND_GIF_LOCAL,
-    ROUND_GIF_URL, PROMO_DIR, PROMO_MUSIC_DIR, PROMO_IMG_EXTS, FFMPEG_PATH,
+    ROUND_GIF_URL, PROMO_DIR, PROMO_IMG_EXTS, FFMPEG_PATH,
     CROWD_REACTIONS,        # already there
-    COMMENTARY_DIR,         # ← add this
+    COMMENTARY_DIR, PROMO_MUSIC_DIR        # ← add this
 )
 
 # ----- Local helpers (presentation) -----
@@ -93,16 +94,86 @@ def _brief_exchange_text(ev: dict) -> str:
 # KD.mp3, Low_Blow.mp3, Swing_Miss.mp3, Tidy_Block.mp3, Mind_Belt.mp3
 # Red_* and Blue_* variants for: Jab, Cross, hook, Uppercut, Block, Guard, Slip, Pressure, Momentum, OverCommits, Cooking, Felt, Fold, Down, Fely (typo?), etc.
 
-# Back-compat: some callers may pass (session, round_idx)
-def _ensure_crowd_state(session: FightSession, *_, **__):
-    if not hasattr(session, "_crowd_seen_families"):
-        session._crowd_seen_families = set()
-    if not hasattr(session, "_crowd_last_line"):
-        session._crowd_last_line = ""
-    if not hasattr(session, "momentum"):
-        session.momentum = 0
-    if not hasattr(session, "crowd_hype"):
-        session.crowd_hype = 0
+# === Crowd ambience loop state (per channel) ===
+CROWD_ACTIVE: dict[int, bool] = {}
+CROWD_TASKS: dict[int, asyncio.Task] = {}
+
+AUDIO_EXTS = (".mp3", ".wav", ".ogg", ".m4a")  # already present above; ok to reuse
+
+def _find_crowd_ambience_file() -> Optional[str]:
+    music_dir = _resolve_music_dir()
+    preferred = [music_dir / "crowd_ambience.mp3", music_dir / "crowd_ambience.wav"]
+    fallbacks = [
+        music_dir / "ambient" / "crowd_ambience.mp3",
+        music_dir / "ambient" / "crowd_ambience.wav",
+        music_dir / "ambient" / "crowd.mp3",
+        music_dir / "ambient" / "crowd.wav",
+        music_dir / "crowd.mp3",
+        music_dir / "crowd.wav",
+    ]
+    for p in preferred + fallbacks:
+        if p.exists():
+            return str(p)
+    return None
+
+def _find_fight_crowd_file() -> Optional[str]:
+    """Loop during the fight."""
+    music_dir = _resolve_music_dir()
+    preferred = [music_dir / "crowd.mp3", music_dir / "crowd.wav"]
+    fallbacks = [
+        music_dir / "ambient" / "crowd.mp3",
+        music_dir / "ambient" / "crowd.wav",
+    ]
+    for p in preferred + fallbacks:
+        if p.exists():
+            return str(p)
+    return None
+
+
+async def _crowd_music_loop(interaction: discord.Interaction, track_path: str):
+    """
+    Loop crowd ambience while:
+      - CROWD_ACTIVE[channel] is True
+      - voice is connected
+    If another clip plays (fighter intro, commentary, etc.), we wait until the
+    voice client is free, then resume the ambience.
+    """
+    vc = await _ensure_voice(interaction)
+    if not vc:
+        return
+    ch_id = interaction.channel_id
+
+    while CROWD_ACTIVE.get(ch_id, False):
+        try:
+            # If something else is playing (intros, commentary), wait and retry
+            if vc.is_playing():
+                await asyncio.sleep(0.5)
+                continue
+            # Play full file once (no fade; we want seamless loop)
+            audio = discord.FFmpegPCMAudio(
+                track_path,
+                executable=FFMPEG_PATH,
+                before_options="-nostdin",
+                options="-vn"
+            )
+            vc.play(audio)
+            # Sleep while it's playing or until we’re told to stop
+            while CROWD_ACTIVE.get(ch_id, False) and vc.is_playing():
+                await asyncio.sleep(0.5)
+        except Exception:
+            # Don’t die on transient FFmpeg/voice hiccups
+            await asyncio.sleep(1.0)
+
+async def stop_crowd_ambience(interaction: discord.Interaction):
+    ch_id = interaction.channel_id
+    CROWD_ACTIVE[ch_id] = False
+    task = CROWD_TASKS.pop(ch_id, None)
+    if task and not task.done():
+        task.cancel()
+    # If ambience is currently the thing playing, stop it
+    vc = interaction.guild.voice_client if interaction.guild else None
+    if vc and vc.is_connected() and vc.is_playing():
+        vc.stop()
 
 def _commentary_exists(name: str) -> Optional[str]:
     """Return a full path if file exists in COMMENTARY_DIR, else None."""
@@ -170,6 +241,7 @@ def _resolve_commentary_file(session: FightSession, ev: dict, tags: list[str]) -
 
     # 5) Miss / Critical miss
     if ev.get("outcome") in ("miss","critical_miss"):
+
         # Try generic swing miss first
         p = _commentary_exists("Swing_Miss.mp3")
         if p: return p
@@ -209,7 +281,7 @@ async def play_commentary_for_event(interaction: discord.Interaction, session: F
             vc.stop()
 
         # 2–3 seconds is perfect; your play_clip helper supports a seconds param
-        await play_clip(vc, path, seconds=3)
+        await play_clip(vc, path, seconds=10)
         # tiny gap to avoid stepping on the next exchange by accident
         await asyncio.sleep(0.05)
     except Exception as e:
@@ -328,14 +400,64 @@ def _resolve_music_dir() -> Path:
     # Fallback: return the first candidate even if it doesn’t exist (so we can show it in the error)
     return candidates[0]
 
+async def stop_all_voice(interaction: discord.Interaction):
+    """
+    Fully stop all voice playback, cancel any promo or crowd loops,
+    and disconnect from the voice channel if connected.
+    """
+    ch_id = interaction.channel_id
+
+    # stop promo and crowd loops if active
+    global PROMO_ACTIVE, PROMO_TASKS, CROWD_ACTIVE, CROWD_TASKS
+
+    # promo
+    try:
+        PROMO_ACTIVE[ch_id] = False
+        task = PROMO_TASKS.pop(ch_id, None)
+        if task and not task.done():
+            task.cancel()
+    except Exception:
+        pass
+
+    # crowd ambience
+    try:
+        CROWD_ACTIVE[ch_id] = False
+        task = CROWD_TASKS.pop(ch_id, None)
+        if task and not task.done():
+            task.cancel()
+    except Exception:
+        pass
+
+    # stop any current voice playback
+    vc = interaction.guild.voice_client if interaction.guild else None
+    if vc:
+        try:
+            if vc.is_playing():
+                vc.stop()
+            if vc.is_connected():
+                await vc.disconnect(force=True)
+        except Exception as e:
+            print(f"[voice stop] {type(e).__name__}: {e}")
 
 def _find_first_audio(music_dir: Path) -> Optional[Path]:
+    """
+    Prefer hype.mp3/hype.wav first, otherwise return the first valid audio file found.
+    """
     if not music_dir.exists():
         return None
+
+    # 1️⃣ Prefer hype.*
+    for fn in ("hype.mp3", "hype.wav", "promo.mp3"):
+        p = music_dir / fn
+        if p.exists():
+            return p
+
+    # 2️⃣ Fallback: first available audio file
     for root, _, files in os.walk(music_dir):
-        for fn in files:
+        for fn in sorted(files):
             if fn.lower().endswith(AUDIO_EXTS):
                 return Path(root) / fn
+
     return None
 
 
@@ -775,16 +897,6 @@ def _find_crowd_track() -> Optional[str]:
             return str(p)
     return None
 
-def ensure_crowd_state(session: FightSession) -> None:
-    if not hasattr(session, "_crowd_seen_families"):
-        session._crowd_seen_families = set()
-    if not hasattr(session, "_crowd_last_line"):
-        session._crowd_last_line = ""
-    if not hasattr(session, "momentum"):
-        session.momentum = 0
-    if not hasattr(session, "crowd_hype"):
-        session.crowd_hype = 0
-
 async def _send_intro_with_ring(interaction: discord.Interaction, red, blue):
     """Single Fight Night embed + short crowd ambience with fade-out."""
     title = "🥊 Fight Night!"
@@ -810,18 +922,20 @@ async def _send_intro_with_ring(interaction: discord.Interaction, red, blue):
         await interaction.followup.send(embed=emb, file=file_to_send)
     else:
         await interaction.followup.send(embed=emb)
-
-    # crowd ambience (doesn't send another embed)
+    # crowd ambience (LOOPS until /fight)
     try:
-        vc = await ensure_voice(interaction)
-        if vc:
-            if vc.is_playing():
-                vc.stop()
-            crowd = _find_crowd_track()
-            if crowd and os.path.exists(crowd):
-                asyncio.create_task(_play_once(vc, crowd, seconds=12.0, fade_out=1.2))
+        await stop_promo_music(interaction)
+        crowd = _find_crowd_ambience_file()
+        if crowd and os.path.exists(crowd):
+            await stop_crowd_ambience(interaction)  # ensure clean state
+            ch_id = interaction.channel_id
+            CROWD_ACTIVE[ch_id] = True
+            CROWD_TASKS[ch_id] = asyncio.create_task(_crowd_music_loop(interaction, crowd))
+        else:
+            print("[crowd] crowd_ambience file not found")
     except Exception as e:
-        print(f"[crowd sfx] failed: {e}")
+        print(f"[crowd] failed to start ambience loop: {e}")
+
 
 async def _send_matchup_gif_and_music(interaction: discord.Interaction, red, blue):
     """Matchup GIF + optional voice intro clips."""
@@ -864,9 +978,9 @@ async def _send_matchup_gif_and_music(interaction: discord.Interaction, red, blu
         if vc.is_playing():
             vc.stop()
         if getattr(red, "intro_music", None):
-            await play_clip(vc, red.intro_music, seconds=15)
+            await play_clip(vc, red.intro_music, seconds=10)
         if getattr(blue, "intro_music", None):
-            await play_clip(vc, blue.intro_music, seconds=15)
+            await play_clip(vc, blue.intro_music, seconds=10)
 
 
 # ----- Cog -----
@@ -975,6 +1089,12 @@ class Match(commands.Cog):
                 "Tip: drop `hype.mp3` here to loop it.",
                 ephemeral=True
             )
+
+    @app_commands.command(name="voice_stop_all", description="Stop all audio and disconnect the bot from voice.")
+    async def voice_stop_all(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        await stop_all_voice(interaction)
+        await interaction.followup.send("🛑 All voice playback stopped and bot disconnected.", ephemeral=True)
 
     @app_commands.command(name="promo_music_test", description="Play first promo track once.")
     async def promo_music_test(self, interaction: discord.Interaction):
@@ -1092,7 +1212,16 @@ class Match(commands.Cog):
     @app_commands.command(name="fight", description="Begin Round 1 (then use /next_round).")
     async def fight(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
+
         try:
+            # stop pre-fight ambience and start in-fight crowd loop
+            await stop_crowd_ambience(interaction)
+            fight_crowd = _find_fight_crowd_file()
+            if fight_crowd and os.path.exists(fight_crowd):
+                ch_id = interaction.channel_id
+                CROWD_ACTIVE[ch_id] = True
+                CROWD_TASKS[ch_id] = asyncio.create_task(_crowd_music_loop(interaction, fight_crowd))
+
             s = SESSIONS.get(interaction.channel_id)
             if not s:
                 await interaction.followup.send("No active match. Use `/start` first.")
@@ -1104,26 +1233,27 @@ class Match(commands.Cog):
                 await interaction.followup.send("Fight already underway. Use `/next_round`.")
                 return
 
-            # in /fight:
+            # per-round state
             _ensure_crowd_state(s)
             _crowd_round_reset(s)
 
             # play the round once
             events, winner_type, loser = run_one_round(s)
 
-            # log it
+            # log first
             s.log.append({
                 "round": s.current_round,
                 "events": events,
                 "hp": {s.A.boxer.name: s.A.hp, s.B.boxer.name: s.B.hp},
             })
 
-            # instant commentary with 2s pacing
+            # stream exchanges (crowd bite + audio + short exchange embed per event)
             for ev in events:
                 crowd_line = await maybe_post_reaction_and_audio(interaction, s, ev)
                 await _send_exchange_note(interaction, s, ev, crowd_line=crowd_line)
                 await asyncio.sleep(2.0)
 
+            # decide end-of-round state
             if winner_type:
                 s.winner_type = winner_type
                 if loser == s.A.boxer.name:
@@ -1132,21 +1262,25 @@ class Match(commands.Cog):
                     s.winner, s.winner_corner = s.A.boxer.name, "Red"
                 s.finished = True
 
+            # round summary
             await send_round_card(interaction, s, events)
-            s.momentum = 0  # reset for next round
 
+            # reset momentum for next round
+            s.momentum = 0
+
+            # finish or advance
             if s.finished:
                 if s.winner_type == "Points":
                     await send_points_decision(interaction, s)
                 else:
                     loser_name = s.B.boxer.name if s.winner_corner == "Red" else s.A.boxer.name
                     await send_finish_announcement(
-                        interaction, s.red_raw, s.blue_raw,
-                        s.winner, s.winner_corner, loser_name, s.winner_type
+                        interaction, s, s.red_raw, s.blue_raw, s.winner, s.winner_corner, loser_name, s.winner_type
                     )
             else:
                 s.current_round += 1
                 await interaction.followup.send("Use `/next_round` to play the next round.")
+
         except Exception as e:
             await interaction.followup.send(f"⚠️ `/fight` crashed: `{type(e).__name__}: {e}`")
             raise
@@ -1161,41 +1295,43 @@ class Match(commands.Cog):
             await interaction.response.send_message(embed=self._summary_embed(s))
             return
 
+        # end-of-fight gate (if we already played 12)
         if s.current_round > 12:
             finalize_if_done(s)
             if s.finished and s.winner_type == "Points":
                 await send_points_decision(interaction, s)
             else:
                 loser_name = s.B.boxer.name if s.winner_corner == "Red" else (
-                    s.A.boxer.name if s.winner_corner == "Blue" else None)
-                await send_finish_announcement(
-                    interaction, s.red_raw, s.blue_raw, s.winner, s.winner_corner, loser_name, s.winner_type
+                    s.A.boxer.name if s.winner_corner == "Blue" else None
                 )
-            await interaction.followup.send(embed=self._summary_embed(s))
-            return
+                # RIGHT
+                await send_finish_announcement(
+                    interaction, s, s.red_raw, s.blue_raw, s.winner, s.winner_corner, loser_name, s.winner_type
+                )
 
         await interaction.response.defer(thinking=True)
 
-        # in /next_round:
+        # per-round crowd state
         _ensure_crowd_state(s)
         _crowd_round_reset(s)
 
-        # play the round once
+        # play the round
         events, winner_type, loser = run_one_round(s)
 
-        # log it
+        # log it immediately
         s.log.append({
             "round": s.current_round,
             "events": events,
             "hp": {s.A.boxer.name: s.A.hp, s.B.boxer.name: s.B.hp},
         })
 
-        # instant commentary with 2s pacing
+        # instant per-exchange notes + (optional) audio bites
         for ev in events:
             crowd_line = await maybe_post_reaction_and_audio(interaction, s, ev)
             await _send_exchange_note(interaction, s, ev, crowd_line=crowd_line)
             await asyncio.sleep(2.0)
 
+        # resolve end state for this round
         if winner_type:
             s.winner_type = winner_type
             if loser == s.A.boxer.name:
@@ -1204,34 +1340,42 @@ class Match(commands.Cog):
                 s.winner, s.winner_corner = s.A.boxer.name, "Red"
             s.finished = True
 
+        # single round summary card (it will internally post ONE crowd/hype line after)
         await send_round_card(interaction, s, events)
-        s.momentum = 0  # reset for next round
 
+        # reset momentum for next round
+        s.momentum = 0
+
+        # finish or advance
         if s.finished:
             if s.winner_type == "Points":
                 await send_points_decision(interaction, s)
             else:
                 loser_name = s.B.boxer.name if s.winner_corner == "Red" else s.A.boxer.name
                 await send_finish_announcement(
-                    interaction, s.red_raw, s.blue_raw, s.winner, s.winner_corner, loser_name, s.winner_type
+                    interaction, s, s.red_raw, s.blue_raw, s.winner, s.winner_corner, loser_name, s.winner_type
                 )
-        else:
-            s.current_round += 1
-            if s.current_round > 12:
-                finalize_if_done(s)
-                if s.finished and s.winner_type == "Points":
-                    await send_points_decision(interaction, s)
-                else:
-                    loser_name = s.B.boxer.name if s.winner_corner == "Red" else (
-                        s.A.boxer.name if s.winner_corner == "Blue" else None)
-                    await send_finish_announcement(
-                        interaction, s.red_raw, s.blue_raw, s.winner, s.winner_corner, loser_name, s.winner_type
-                    )
-                await interaction.followup.send(embed=self._summary_embed(s))
+            await interaction.followup.send(embed=self._summary_embed(s))
+            return
+
+        # still going — move to next round (and handle 12→cards path)
+        s.current_round += 1
+        if s.current_round > 12:
+            finalize_if_done(s)
+            if s.finished and s.winner_type == "Points":
+                await send_points_decision(interaction, s)
             else:
-                await interaction.followup.send(
-                    f"Round {s.current_round - 1} complete. Use `/next_round` for Round {s.current_round}."
+                loser_name = s.B.boxer.name if s.winner_corner == "Red" else (
+                    s.A.boxer.name if s.winner_corner == "Blue" else None
                 )
+                await send_finish_announcement(
+                    interaction, s, s.red_raw, s.blue_raw, s.winner, s.winner_corner, loser_name, s.winner_type
+                )
+            await interaction.followup.send(embed=self._summary_embed(s))
+        else:
+            await interaction.followup.send(
+                f"Round {s.current_round - 1} complete. Use `/next_round` for Round {s.current_round}."
+            )
 
     @app_commands.command(name="resolve_test", description="(TEST) Force-resolve the current fight.")
     @app_commands.describe(method="KO | TKO | Points", winner="Red | Blue")
@@ -1252,46 +1396,53 @@ class Match(commands.Cog):
             method: app_commands.Choice[str],
             winner: app_commands.Choice[str],
     ):
-        s = SESSIONS.get(interaction.channel_id)
-        if not s:
-            await interaction.response.send_message("No active match.", ephemeral=True)
-            return
-        if s.finished:
-            await interaction.response.send_message("This fight is already finished.", ephemeral=True)
-            return
-
+        # 1) ACK immediately so Discord stops showing "thinking…"
         await interaction.response.defer(thinking=False)
-        if winner.value == "Red":
-            s.winner, s.winner_corner, loser_name = s.A.boxer.name, "Red", s.B.boxer.name
-        else:
-            s.winner, s.winner_corner, loser_name = s.B.boxer.name, "Blue", s.A.boxer.name
 
-        s.winner_type = method.value
-        s.finished = True
+        try:
+            s = SESSIONS.get(interaction.channel_id)
+            if not s:
+                await interaction.followup.send("No active match.", ephemeral=True)
+                return
+            if s.finished:
+                await interaction.followup.send("This fight is already finished.", ephemeral=True)
+                return
 
-        if method.value == "Points":
-            if not getattr(s, "judge_cards", None):
-                from ..services.combat import compute_scorecards
-                s.judge_cards = compute_scorecards(s)
-            await send_points_decision(interaction, s)
-        else:
-            await send_finish_announcement(
-                interaction, s.red_raw, s.blue_raw, s.winner, s.winner_corner, loser_name, s.winner_type
+            # 2) Decide winner/loser + mark finished
+            if winner.value == "Red":
+                s.winner, s.winner_corner, loser_name = s.A.boxer.name, "Red", s.B.boxer.name
+            else:
+                s.winner, s.winner_corner, loser_name = s.B.boxer.name, "Blue", s.A.boxer.name
+
+            s.winner_type = method.value
+            s.finished = True
+
+            # Small immediate follow-up so users see movement
+            await interaction.followup.send(
+                f"Resolving as **{s.winner} ({s.winner_corner}) – {s.winner_type}**…"
             )
 
-    # helper as an instance method (since you call self._summary_embed)
-    def _summary_embed(self, s: FightSession) -> discord.Embed:
-        if s.winner and s.winner_type:
-            desc = f"{s.winner} wins by {s.winner_type}!"
-        elif s.finished and not s.winner:
-            desc = "Draw after 12 rounds."
-        else:
-            desc = f"Fight in progress — Round {s.current_round} next."
-        e = discord.Embed(title="Fight Status", description=desc, color=discord.Color.gold())
-        e.add_field(name=f"🔴 {s.A.boxer.name} (Red)", value=f"HP: **{max(0, s.A.hp)}**", inline=True)
-        e.add_field(name=f"🔵 {s.B.boxer.name} (Blue)", value=f"HP: **{max(0, s.B.hp)}**", inline=True)
-        return e
+            # 3) Show outcome
+            if s.winner_type == "Points":
+                # ensure judge cards exist (safe even if log is empty)
+                if not getattr(s, "judge_cards", None):
+                    s.judge_cards = compute_scorecards(s)
+                await send_points_decision(interaction, s)
+            else:
+                await send_finish_announcement(
+                    interaction,
+                    s.red_raw,
+                    s.blue_raw,
+                    s.winner,
+                    s.winner_corner,
+                    loser_name,
+                    s.winner_type
+                )
 
+        except Exception as e:
+            # 4) Never leave the interaction hanging
+            await interaction.followup.send(f"⚠️ resolve_test error: `{type(e).__name__}: {e}`", ephemeral=True)
+            raise
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Match(bot))

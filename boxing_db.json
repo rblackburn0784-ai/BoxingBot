@@ -1,57 +1,43 @@
 {
+  "version": 2,
   "boxers": {
-    "thedude": {
-      "name": "TheDude",
-      "power": 15,
-      "speed": 5,
-      "accuracy": 15,
-      "defense": 10,
-      "footwork": 5,
-      "stamina": 5,
-      "chin": 1,
-      "body": 1,
-      "intro": "TheDude Abides",
-      "intro_music": "graphics/music/WTSGD.MP3",
+    "comradetriplet": {
+      "name": "ComradeTripleT",
+      "power": 20,
+      "speed": 6,
+      "accuracy": 20,
+      "defense": 4,
+      "footwork": 0,
+      "stamina": 8,
+      "chin": 2,
+      "body": 0,
+      "intro": "Now making his way to the ring the Gulag alumni the Ushanka overlord the Minister of Mayhem the Baron of Bruises the Count of Cold Violence the Human Snowplough. COMRADE FUCKIN TONY",
+      "intro_music": "C:\\Users\\pure_\\PycharmProjects\\Boxing_Bot V2\\graphics\\music\\Momma Said Knock You Out.mp3",
       "gender": "male",
-      "weight_kg": 70.0,
-      "weight_class": "middleweight",
+      "weight_kg": 91.0,
+      "weight_class": "heavyweight",
       "trait": "Sharp Eyes"
     },
-    "tonythetailor": {
-      "name": "TonyTheTailor",
+    "beluga_the_whale": {
+      "name": "beluga_the_whale",
       "power": 10,
-      "speed": 10,
-      "accuracy": 8,
-      "defense": 12,
-      "footwork": 7,
-      "stamina": 4,
-      "chin": 2,
-      "body": 1,
-      "intro": "Snitches Wear Stiches",
-      "intro_music": "graphics/music/Donna.mp3",
-      "gender": "male",
-      "weight_kg": 70.0,
-      "weight_class": "middleweight",
-      "trait": "Gas Tank"
-    },
-    "maddyperez": {
-      "name": "MaddyPerez",
-      "power": 15,
-      "speed": 20,
+      "speed": 7,
       "accuracy": 5,
-      "defense": 14,
-      "footwork": 4,
-      "stamina": 15,
-      "chin": 2,
-      "body": 2,
-      "intro": "Takin' Care Of Business",
-      "intro_music": "C:\\Users\\pure_\\PycharmProjects\\Boxing Bot V1\\graphics\\music\\Im Not In Love.mp3",
-      "gender": "female",
-      "weight_kg": 66.7,
-      "weight_class": "welterweight",
-      "trait": "Quick Feet"
+      "defense": 8,
+      "footwork": 7,
+      "stamina": 10,
+      "chin": 6,
+      "body": 7,
+      "intro": "Freebird",
+      "intro_music": "C:\\Users\\pure_\\PycharmProjects\\Boxing_Bot V2\\graphics\\music\\Freebird.mp3",
+      "gender": "male",
+      "weight_kg": 91.0,
+      "weight_class": "heavyweight",
+      "trait": "Iron Body"
     }
   },
+  "fights": {},
+  "boxer_stats": {},
   "weight_classes": {
     "flyweight": {
       "name": "Flyweight",
@@ -88,6 +74,27 @@
       "limit_kg": 90.7,
       "nickname": "Titans of the Canvas",
       "description": "When these giants swing, the air itself flinches. Every punch is a sermon \u2014 every knockout, a revelation."
+    }
+  },
+  "tournaments": {
+    "tourn_tdf_inaugural": {
+      "id": "tourn_tdf_inaugural",
+      "name": "TheDude Federation Inaugural Tournament",
+      "status": "pending",
+      "type": "ko",
+      "participants": [],
+      "bracket": [],
+      "winner": null
+    }
+  },
+  "leagues": {
+    "league_tdf": {
+      "id": "league_tdf",
+      "name": "TheDude Federation",
+      "status": "pending",
+      "participants": [],
+      "fixtures": [],
+      "table": {}
     }
   }
 }

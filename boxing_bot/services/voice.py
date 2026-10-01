@@ -1,5 +1,5 @@
 # boxing_bot/services/voice.py
-import os, asyncio
+import os, asyncio, shutil
 import discord
 from typing import Optional
 from ..config import SETTINGS
@@ -27,29 +27,53 @@ async def ensure_voice(interaction: discord.Interaction) -> Optional[discord.Voi
     except Exception as e:
         await interaction.followup.send(f"Couldn’t join your voice channel: `{e}`", ephemeral=True); return None
 
-async def play_clip(vc: discord.VoiceClient, source: str, seconds: int = 15):
-    if not source: return
+async def play_clip(
+    vc: discord.VoiceClient,
+    source: str,
+    seconds: Optional[float] = None,
+    *,
+    interrupt: bool = True,
+):
+    """Play a local/remote clip.
+
+    ``seconds=None`` plays the file to natural completion.  This fixes the
+    commentary cutoff caused by forcing every clip through FFmpeg ``-t``.
+    When ``interrupt`` is False, an already-playing clip is left alone and the
+    new clip is skipped instead of chopping the current audio mid-sentence.
+    """
+    if not source:
+        return
     try:
         is_url = _is_url(source)
         if not is_url:
             src = os.path.abspath(source)
             if not os.path.exists(src):
                 ensure_music_dir()
-                alt = os.path.join(SETTINGS.MUSIC_DIR, os.path.basename(source))
-                alt = os.path.abspath(alt)
-                if os.path.exists(alt): src = alt
-                else: return
-            before_opts = "-nostdin"
+                alt = os.path.abspath(os.path.join(str(SETTINGS.MUSIC_DIR), os.path.basename(source)))
+                if os.path.exists(alt):
+                    src = alt
+                else:
+                    return
         else:
-            src = source; before_opts = "-nostdin"
-        if vc.is_playing(): vc.stop()
+            src = source
+
+        if vc.is_playing():
+            if not interrupt:
+                return
+            vc.stop()
+
+        options = "-vn"
+        if seconds is not None:
+            options += f" -t {float(seconds):.2f}"
+
         audio = discord.FFmpegPCMAudio(
-            src, executable=SETTINGS.FFMPEG_PATH, before_options=before_opts, options=f"-vn -t {int(seconds)}"
+            src,
+            executable=(shutil.which("ffmpeg") or SETTINGS.FFMPEG_PATH),
+            before_options="-nostdin",
+            options=options,
         )
         vc.play(audio)
-        waited = 0.0
-        while vc.is_playing() and waited < seconds + 2:
-            await asyncio.sleep(0.5); waited += 0.5
-        vc.stop()
+        while vc.is_playing():
+            await asyncio.sleep(0.25)
     except Exception as e:
         print(f"[audio] FFmpeg play error: {e}")

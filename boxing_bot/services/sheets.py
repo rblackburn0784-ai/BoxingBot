@@ -7,7 +7,7 @@ from typing import Dict, Any, Tuple, List, Optional
 import requests  # pip install requests
 import gspread   # pip install gspread google-auth
 from google.oauth2.service_account import Credentials
-from ..models import Boxer
+from ..models import Boxer, _weight_kg_from_class
 from ..services.roster import save_boxer, get_boxer  # upsert + lookup
 from ..config import SETTINGS
 import re
@@ -148,12 +148,9 @@ def _auth_client() -> gspread.Client:
     if json_path:
         creds = Credentials.from_service_account_file(json_path, scopes=scopes)
     elif inline_json:
-        import json, tempfile
+        import json
         data = json.loads(inline_json)
-        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as f:
-            json.dump(data, f)
-            temp_path = f.name
-        creds = Credentials.from_service_account_file(temp_path, scopes=scopes)
+        creds = Credentials.from_service_account_info(data, scopes=scopes)
     else:
         raise RuntimeError("No service account credentials found. Set GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_SERVICE_ACCOUNT_JSON.")
     return gspread.authorize(creds)
@@ -278,6 +275,9 @@ def upsert_boxers_from_sheet(sheet_id_or_url: str, tab_name_or_range: str = "She
             skipped += 1
             continue
 
+        if boxer.total_points() != SETTINGS.BASE_STAT_POINT_CAP:
+            skipped += 1
+            continue
         existed = get_boxer(boxer.name) is not None
         save_boxer(boxer)  # normalizes + persists
         if existed:

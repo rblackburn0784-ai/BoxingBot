@@ -49,6 +49,7 @@ class Imports(commands.Cog):
         sheet_id_or_url="https://docs.google.com/spreadsheets/d/1nhdVrd9f4N-w_3vNAwh_mzGhWRDJrnyF-uccQQbAFPY/edit?usp=sharing",
         tab_or_range="Tab name or A1 range (e.g., Roster!A1:O)"
     )
+    @app_commands.checks.has_permissions(administrator=True)
     async def boxers_import_sheet(self, interaction: discord.Interaction,
                                   sheet_id_or_url: str,
                                   tab_or_range: str = "Sheet1!A1:Z"):

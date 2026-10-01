@@ -2,6 +2,8 @@
 
 import os
 import random
+import secrets
+import functools
 import discord
 import asyncio
 from typing import Optional, List
@@ -21,11 +23,12 @@ from ..services.combat import (
     send_round_card,
     send_points_decision,
     send_finish_announcement,
+    compute_scorecards,
     maybe_post_crowd_reaction,
 )
 from ..services.presentation import momentum_bar
 
-from ..services.state import SESSIONS
+from ..services.state import SESSIONS, save_sessions, get_fight_lock
 from ..services.voice import ensure_voice, play_clip
 from ..services.music import display_music_label
 from ..config import (
@@ -276,12 +279,9 @@ async def play_commentary_for_event(interaction: discord.Interaction, session: F
         if not vc:
             return
 
-        # keep it snappy; stop older short clip if playing
-        if vc.is_playing():
-            vc.stop()
-
-        # 2–3 seconds is perfect; your play_clip helper supports a seconds param
-        await play_clip(vc, path, seconds=10)
+        # Let commentary finish naturally; if another clip is already playing,
+        # skip this bite rather than cutting the current one off mid-sentence.
+        await play_clip(vc, path, seconds=None, interrupt=True)
         # tiny gap to avoid stepping on the next exchange by accident
         await asyncio.sleep(0.05)
     except Exception as e:
@@ -859,20 +859,25 @@ def _compose_side_by_side(path_left: str, path_right: str) -> Optional[str]:
 
 class PromoSelection(discord.ui.Select):
     def __init__(self, options: List[str], placeholder: str):
-        items = [discord.SelectOption(label=n.title(), value=n) for n in options]
-        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=items)
-
+        items=[discord.SelectOption(label=n[:100],value=n) for n in options[:25]]
+        super().__init__(placeholder=placeholder[:150],min_values=1,max_values=1,options=items)
     async def callback(self, interaction: discord.Interaction):
-        self.view.selected = self.values[0]
-        await interaction.response.defer()
-        self.view.stop()
-
+        self.view.selected=self.values[0]; await interaction.response.defer(); self.view.stop()
 
 class PromoView(discord.ui.View):
-    def __init__(self, names: List[str], placeholder: str):
-        super().__init__(timeout=60)
-        self.selected: Optional[str] = None
-        self.add_item(PromoSelection(names, placeholder))
+    PAGE_SIZE=23
+    def __init__(self,names:List[str],placeholder:str):
+        super().__init__(timeout=60); self.selected=None; self.names=list(names); self.placeholder=placeholder; self.page=0; self._render()
+    def _render(self):
+        self.clear_items(); start=self.page*self.PAGE_SIZE; chunk=self.names[start:start+self.PAGE_SIZE]
+        pages=max(1,(len(self.names)+self.PAGE_SIZE-1)//self.PAGE_SIZE)
+        self.add_item(PromoSelection(chunk,f"{self.placeholder} ({self.page+1}/{pages})"))
+        if len(self.names)>self.PAGE_SIZE:
+            prev=discord.ui.Button(label="◀ Previous",style=discord.ButtonStyle.secondary,disabled=self.page==0)
+            nxt=discord.ui.Button(label="Next ▶",style=discord.ButtonStyle.secondary,disabled=start+self.PAGE_SIZE>=len(self.names))
+            async def pc(i): self.page-=1; self._render(); await i.response.edit_message(view=self)
+            async def nc(i): self.page+=1; self._render(); await i.response.edit_message(view=self)
+            prev.callback=pc; nxt.callback=nc; self.add_item(prev); self.add_item(nxt)
 
 def _find_crowd_track() -> Optional[str]:
     """Find a crowd ambience file in resolved music dir or common names."""
@@ -985,9 +990,33 @@ async def _send_matchup_gif_and_music(interaction: discord.Interaction, red, blu
 
 # ----- Cog -----
 
+def _serial_fight_action(func):
+    @functools.wraps(func)
+    async def wrapped(self, interaction: discord.Interaction, *args, **kwargs):
+        async with get_fight_lock(interaction.channel_id):
+            return await func(self, interaction, *args, **kwargs)
+    return wrapped
+
+
 class Match(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    def _summary_embed(self, s: FightSession) -> discord.Embed:
+        result = "Draw" if not s.winner else f"{s.winner} — {s.winner_type or 'Result'}"
+        emb = discord.Embed(title="🥊 Fight Summary", description=f"**{result}**", color=discord.Color.gold())
+        emb.add_field(name=f"🔴 {s.A.boxer.name}", value=f"HP {max(0,s.A.hp)} • KDs scored {s.kd_total.get('B',0)} • Warnings {s.A.warnings}", inline=False)
+        emb.add_field(name=f"🔵 {s.B.boxer.name}", value=f"HP {max(0,s.B.hp)} • KDs scored {s.kd_total.get('A',0)} • Warnings {s.B.warnings}", inline=False)
+        emb.set_footer(text=f"Rounds logged: {len(s.log)} • Seed: {s.rng_seed}")
+        return emb
+
+    def _record_v2_result(self, interaction: discord.Interaction, s: FightSession) -> None:
+        try:
+            from ..services.game import finalize_session
+            finalize_session(s, guild_id=interaction.guild_id)
+        except Exception as exc:
+            # Career persistence must never prevent the fight presentation from finishing.
+            print(f"[V2 career] result persistence failed: {type(exc).__name__}: {exc}")
 
     @app_commands.command(
         name="promo",
@@ -996,7 +1025,8 @@ class Match(commands.Cog):
     async def promo(self, interaction: discord.Interaction):
         from ..services.roster import list_boxers  # lazy import to avoid circulars
 
-        names = list_boxers()
+        from ..services.game import competitive_legal
+        names = [n for n in list_boxers() if competitive_legal(n)[0]]
         if not names:
             await interaction.response.send_message("No boxers yet. Use /boxer_create first.", ephemeral=True)
             return
@@ -1054,6 +1084,12 @@ class Match(commands.Cog):
             emb.add_field(name="Poster", value="No images found in `/graphics/promo/`.", inline=False)
             await interaction.followup.send(embed=emb)
 
+        if poster and Path(poster).name.startswith(("_poster_", "_composite_")):
+            try:
+                Path(poster).unlink(missing_ok=True)
+            except OSError:
+                pass
+
         # === MUSIC LOOP (inside the function!) ===
         music_dir = _resolve_music_dir()
         track_path = _find_first_audio(music_dir)
@@ -1091,6 +1127,7 @@ class Match(commands.Cog):
             )
 
     @app_commands.command(name="voice_stop_all", description="Stop all audio and disconnect the bot from voice.")
+    @app_commands.checks.has_permissions(administrator=True)
     async def voice_stop_all(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         await stop_all_voice(interaction)
@@ -1111,14 +1148,18 @@ class Match(commands.Cog):
         await interaction.followup.send(f"Played: `{_P(track).name}`", ephemeral=True)
 
     @app_commands.command(name="promo_stop", description="Stop any active promo loop & music in this channel.")
+    @app_commands.checks.has_permissions(administrator=True)
     async def promo_stop(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=False, ephemeral=True)
         await stop_promo_music(interaction)
         await interaction.followup.send("🛑 Promo stopped in this channel.", ephemeral=True)
 
     @app_commands.command(name="start", description="Pick two boxers, show ring + intros.")
+    @app_commands.checks.has_permissions(administrator=True)
+    @_serial_fight_action
     async def start(self, interaction: discord.Interaction):
-        names = list_boxers()
+        from ..services.game import competitive_legal
+        names = [n for n in list_boxers() if competitive_legal(n)[0]]
         if not names:
             await interaction.response.send_message("No boxers available. Use `/boxer_create` first.", ephemeral=True)
             return
@@ -1147,8 +1188,9 @@ class Match(commands.Cog):
         second_name = view2.selected_boxer
 
         try:
-            A = get_boxer(first_name)
-            B = get_boxer(second_name)
+            from ..services.game import competition_boxer
+            A = competition_boxer(interaction.guild_id, first_name)
+            B = competition_boxer(interaction.guild_id, second_name)
             if not A or not B:
                 await interaction.edit_original_response(content="❌ Could not load both fighters.", view=None)
                 return
@@ -1159,14 +1201,15 @@ class Match(commands.Cog):
             )
 
             # Corner assignment + session build
-            rng = random.Random()
+            seed = secrets.randbits(64)
+            rng = random.Random(seed)
             (red_info, blue_info) = corner_assignments(A, B, rng)
             red_raw, blue_raw = red_info[1], blue_info[1]
             red_eff, blue_eff = effective_boxer(red_raw), effective_boxer(blue_raw)
 
             session = FightSession(
                 channel_id=interaction.channel_id,
-                rng_seed=None,
+                rng_seed=seed,
                 rng=rng,
                 red_raw=red_raw,
                 blue_raw=blue_raw,
@@ -1178,6 +1221,7 @@ class Match(commands.Cog):
                 kd_limit=3,
             )
             SESSIONS[interaction.channel_id] = session
+            save_sessions()
 
             # Public confirmation
             await interaction.followup.send(
@@ -1210,6 +1254,8 @@ class Match(commands.Cog):
             raise
 
     @app_commands.command(name="fight", description="Begin Round 1 (then use /next_round).")
+    @app_commands.checks.has_permissions(administrator=True)
+    @_serial_fight_action
     async def fight(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
 
@@ -1246,6 +1292,7 @@ class Match(commands.Cog):
                 "events": events,
                 "hp": {s.A.boxer.name: s.A.hp, s.B.boxer.name: s.B.hp},
             })
+            save_sessions()
 
             # stream exchanges (crowd bite + audio + short exchange embed per event)
             for ev in events:
@@ -1261,6 +1308,7 @@ class Match(commands.Cog):
                 else:
                     s.winner, s.winner_corner = s.A.boxer.name, "Red"
                 s.finished = True
+                save_sessions()
 
             # round summary
             await send_round_card(interaction, s, events)
@@ -1270,6 +1318,7 @@ class Match(commands.Cog):
 
             # finish or advance
             if s.finished:
+                self._record_v2_result(interaction, s)
                 if s.winner_type == "Points":
                     await send_points_decision(interaction, s)
                 else:
@@ -1279,6 +1328,7 @@ class Match(commands.Cog):
                     )
             else:
                 s.current_round += 1
+                save_sessions()
                 await interaction.followup.send("Use `/next_round` to play the next round.")
 
         except Exception as e:
@@ -1286,6 +1336,8 @@ class Match(commands.Cog):
             raise
 
     @app_commands.command(name="next_round", description="Advance to the next round.")
+    @app_commands.checks.has_permissions(administrator=True)
+    @_serial_fight_action
     async def next_round(self, interaction: discord.Interaction):
         s = SESSIONS.get(interaction.channel_id)
         if not s:
@@ -1298,6 +1350,9 @@ class Match(commands.Cog):
         # end-of-fight gate (if we already played 12)
         if s.current_round > 12:
             finalize_if_done(s)
+            save_sessions()
+            if s.finished:
+                self._record_v2_result(interaction, s)
             if s.finished and s.winner_type == "Points":
                 await send_points_decision(interaction, s)
             else:
@@ -1308,6 +1363,7 @@ class Match(commands.Cog):
                 await send_finish_announcement(
                     interaction, s, s.red_raw, s.blue_raw, s.winner, s.winner_corner, loser_name, s.winner_type
                 )
+            return
 
         await interaction.response.defer(thinking=True)
 
@@ -1324,6 +1380,7 @@ class Match(commands.Cog):
             "events": events,
             "hp": {s.A.boxer.name: s.A.hp, s.B.boxer.name: s.B.hp},
         })
+        save_sessions()
 
         # instant per-exchange notes + (optional) audio bites
         for ev in events:
@@ -1339,6 +1396,7 @@ class Match(commands.Cog):
             else:
                 s.winner, s.winner_corner = s.A.boxer.name, "Red"
             s.finished = True
+            save_sessions()
 
         # single round summary card (it will internally post ONE crowd/hype line after)
         await send_round_card(interaction, s, events)
@@ -1348,6 +1406,7 @@ class Match(commands.Cog):
 
         # finish or advance
         if s.finished:
+            self._record_v2_result(interaction, s)
             if s.winner_type == "Points":
                 await send_points_decision(interaction, s)
             else:
@@ -1360,8 +1419,12 @@ class Match(commands.Cog):
 
         # still going — move to next round (and handle 12→cards path)
         s.current_round += 1
+        save_sessions()
         if s.current_round > 12:
             finalize_if_done(s)
+            save_sessions()
+            if s.finished:
+                self._record_v2_result(interaction, s)
             if s.finished and s.winner_type == "Points":
                 await send_points_decision(interaction, s)
             else:
@@ -1390,6 +1453,8 @@ class Match(commands.Cog):
             app_commands.Choice(name="Blue", value="Blue"),
         ],
     )
+    @app_commands.checks.has_permissions(administrator=True)
+    @_serial_fight_action
     async def resolve_test(
             self,
             interaction: discord.Interaction,
@@ -1416,6 +1481,8 @@ class Match(commands.Cog):
 
             s.winner_type = method.value
             s.finished = True
+            save_sessions()
+            self._record_v2_result(interaction, s)
 
             # Small immediate follow-up so users see movement
             await interaction.followup.send(
@@ -1431,6 +1498,7 @@ class Match(commands.Cog):
             else:
                 await send_finish_announcement(
                     interaction,
+                    s,
                     s.red_raw,
                     s.blue_raw,
                     s.winner,

@@ -12,7 +12,7 @@
       "chin": 2,
       "body": 0,
       "intro": "Now making his way to the ring the Gulag alumni the Ushanka overlord the Minister of Mayhem the Baron of Bruises the Count of Cold Violence the Human Snowplough. COMRADE FUCKIN TONY",
-      "intro_music": "C:\\Users\\pure_\\PycharmProjects\\Boxing_Bot V2\\graphics\\music\\Momma Said Knock You Out.mp3",
+      "intro_music": "Momma Said Knock You Out.mp3",
       "gender": "male",
       "weight_kg": 91.0,
       "weight_class": "heavyweight",
@@ -29,7 +29,7 @@
       "chin": 6,
       "body": 7,
       "intro": "Freebird",
-      "intro_music": "C:\\Users\\pure_\\PycharmProjects\\Boxing_Bot V2\\graphics\\music\\Freebird.mp3",
+      "intro_music": "Freebird.mp3",
       "gender": "male",
       "weight_kg": 91.0,
       "weight_class": "heavyweight",
@@ -43,37 +43,37 @@
       "name": "Flyweight",
       "limit_kg": 51.0,
       "nickname": "Speed Demons",
-      "description": "Lightning-fast fighters who dance across the canvas like ghosts \u2014 what they lack in brute force, they make up for in precision and flair."
+      "description": "Lightning-fast fighters who dance across the canvas like ghosts — what they lack in brute force, they make up for in precision and flair."
     },
     "bantamweight": {
       "name": "Bantamweight",
       "limit_kg": 53.5,
       "nickname": "Technical Artists",
-      "description": "Smart, sharp, and strategic. Every jab\u2019s a brushstroke \u2014 these fighters win with rhythm, timing, and brains over brawn."
+      "description": "Smart, sharp, and strategic. Every jab’s a brushstroke — these fighters win with rhythm, timing, and brains over brawn."
     },
     "featherweight": {
       "name": "Featherweight",
       "limit_kg": 57.2,
       "nickname": "Showstoppers",
-      "description": "All about balance \u2014 fast hands, sharp minds, and enough pop in their punches to make the crowd gasp."
+      "description": "All about balance — fast hands, sharp minds, and enough pop in their punches to make the crowd gasp."
     },
     "welterweight": {
       "name": "Welterweight",
       "limit_kg": 66.7,
       "nickname": "All-Rounders",
-      "description": "The heart of the Federation \u2014 strong, agile, and adaptable. Every match here feels like a main event."
+      "description": "The heart of the Federation — strong, agile, and adaptable. Every match here feels like a main event."
     },
     "middleweight": {
       "name": "Middleweight",
       "limit_kg": 72.6,
       "nickname": "Precision Powerhouses",
-      "description": "Calculated aggression and perfect form. These are the tacticians \u2014 they hit hard but never lose control."
+      "description": "Calculated aggression and perfect form. These are the tacticians — they hit hard but never lose control."
     },
     "heavyweight": {
       "name": "Heavyweight",
       "limit_kg": 90.7,
       "nickname": "Titans of the Canvas",
-      "description": "When these giants swing, the air itself flinches. Every punch is a sermon \u2014 every knockout, a revelation."
+      "description": "When these giants swing, the air itself flinches. Every punch is a sermon — every knockout, a revelation."
     }
   },
   "tournaments": {

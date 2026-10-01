@@ -22,7 +22,7 @@ def normalize_music_input(s: str) -> str:
     base = os.path.basename(s)
     if not base.lower().endswith(".mp3"): base += ".mp3"
     ensure_music_dir()
-    return os.path.join(MUSIC_DIR, base)
+    return base
 
 def display_music_label(path: str) -> str:
     base = os.path.basename(path or "")

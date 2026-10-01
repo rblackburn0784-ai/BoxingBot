@@ -50,21 +50,25 @@ class Boxer:
     def max_hp(self) -> int: return 100
 
 def get_weight_class(weight_kg: float) -> str:
-    if weight_kg <= 51.0:  return "flyweight"
-    if weight_kg <= 53.5:  return "bantamweight"
-    if weight_kg <= 57.2:  return "featherweight"
-    if weight_kg <= 66.7:  return "welterweight"
-    if weight_kg <= 72.6:  return "middleweight"
+    if weight_kg <= 51.0: return "flyweight"
+    if weight_kg <= 53.5: return "bantamweight"
+    if weight_kg <= 57.2: return "featherweight"
+    if weight_kg <= 61.2: return "lightweight"
+    if weight_kg <= 66.7: return "welterweight"
+    if weight_kg <= 72.6: return "middleweight"
+    if weight_kg <= 79.4: return "light heavyweight"
+    if weight_kg <= 90.7: return "cruiserweight"
     return "heavyweight"
 
 WEIGHT_CLASS_MODIFIERS: Dict[str, Dict[str, int]] = {
-    "flyweight":   {"speed": +3, "stamina": +2, "power": -2, "defence": +1, "footwork": +3, "body": -2},
-    "bantamweight":{"speed": +2, "stamina": +1, "power": -1, "accuracy": +1, "footwork": +2, "body": -1},
-    "featherweight":{"speed": +1, "power": 0, "stamina": +1, "defence": 0, "footwork": +1, "body": 0},
-    "welterweight":{"speed": 0, "stamina": 0, "power": 0, "defence": 0, "footwork": 0, "body": 0},
-    "middleweight":{"speed": -1, "stamina": -1, "power": +2, "defence": +1, "footwork": -1, "body": +2},
-    "heavyweight":{"speed": -2, "stamina": 0, "power": +4, "defence": +2, "footwork": -3, "body": +4},
+    # V2 fairness rule: weight classes define divisions and presentation, not free combat points.
+    # This prevents min-max builds from evading negative modifiers through zero-value clamping.
+    "flyweight": {}, "bantamweight": {}, "featherweight": {}, "lightweight": {},
+    "welterweight": {}, "middleweight": {}, "light heavyweight": {},
+    "cruiserweight": {}, "heavyweight": {},
 }
+
+
 
 @dataclass
 class FighterState:

@@ -33,5 +33,5 @@ def boxer_embed(b: Boxer) -> discord.Embed:
     if b.intro:
         e.add_field(name="Intro", value=b.intro[:1024], inline=False)
 
-    e.set_footer(text=f"Total base points: {b.total_points()} / 100 • Stats shown include weight-class modifiers")
+    e.set_footer(text=f"Total base points: {b.total_points()} / 60 • Stats shown include weight-class modifiers")
     return e

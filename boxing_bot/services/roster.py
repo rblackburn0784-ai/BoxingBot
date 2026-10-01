@@ -4,6 +4,7 @@ import dataclasses
 from typing import Optional, List
 from ..storage.db import DB, save_db      # <-- relative
 from ..models import Boxer, _norm_gender, get_weight_class
+from .music import normalize_music_input
 
 def save_boxer(b: Boxer):
     b.gender = _norm_gender(b.gender)
@@ -15,6 +16,9 @@ def get_boxer(name: str) -> Optional[Boxer]:
     b = DB["boxers"].get(name.lower())
     if not b: return None
     b.setdefault("intro",""); b.setdefault("intro_music",""); b.setdefault("trait","")
+    if b.get("intro_music"):
+        # Legacy DBs stored machine-specific absolute Windows paths. Relocate by filename.
+        b["intro_music"] = normalize_music_input(b["intro_music"])
     b["gender"] = _norm_gender(b.get("gender","male"))
     b.setdefault("weight_kg", 66.7)
     b["weight_class"] = get_weight_class(b["weight_kg"])

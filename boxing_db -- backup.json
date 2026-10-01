@@ -1,0 +1,93 @@
+{
+  "boxers": {
+    "thedude": {
+      "name": "TheDude",
+      "power": 15,
+      "speed": 5,
+      "accuracy": 15,
+      "defense": 10,
+      "footwork": 5,
+      "stamina": 5,
+      "chin": 1,
+      "body": 1,
+      "intro": "TheDude Abides",
+      "intro_music": "graphics/music/WTSGD.MP3",
+      "gender": "male",
+      "weight_kg": 70.0,
+      "weight_class": "middleweight",
+      "trait": "Sharp Eyes"
+    },
+    "tonythetailor": {
+      "name": "TonyTheTailor",
+      "power": 10,
+      "speed": 10,
+      "accuracy": 8,
+      "defense": 12,
+      "footwork": 7,
+      "stamina": 4,
+      "chin": 2,
+      "body": 1,
+      "intro": "Snitches Wear Stiches",
+      "intro_music": "graphics/music/Donna.mp3",
+      "gender": "male",
+      "weight_kg": 70.0,
+      "weight_class": "middleweight",
+      "trait": "Gas Tank"
+    },
+    "maddyperez": {
+      "name": "MaddyPerez",
+      "power": 15,
+      "speed": 20,
+      "accuracy": 5,
+      "defense": 14,
+      "footwork": 4,
+      "stamina": 15,
+      "chin": 2,
+      "body": 2,
+      "intro": "Takin' Care Of Business",
+      "intro_music": "C:\\Users\\pure_\\PycharmProjects\\Boxing Bot V1\\graphics\\music\\Im Not In Love.mp3",
+      "gender": "female",
+      "weight_kg": 66.7,
+      "weight_class": "welterweight",
+      "trait": "Quick Feet"
+    }
+  },
+  "weight_classes": {
+    "flyweight": {
+      "name": "Flyweight",
+      "limit_kg": 51.0,
+      "nickname": "Speed Demons",
+      "description": "Lightning-fast fighters who dance across the canvas like ghosts \u2014 what they lack in brute force, they make up for in precision and flair."
+    },
+    "bantamweight": {
+      "name": "Bantamweight",
+      "limit_kg": 53.5,
+      "nickname": "Technical Artists",
+      "description": "Smart, sharp, and strategic. Every jab\u2019s a brushstroke \u2014 these fighters win with rhythm, timing, and brains over brawn."
+    },
+    "featherweight": {
+      "name": "Featherweight",
+      "limit_kg": 57.2,
+      "nickname": "Showstoppers",
+      "description": "All about balance \u2014 fast hands, sharp minds, and enough pop in their punches to make the crowd gasp."
+    },
+    "welterweight": {
+      "name": "Welterweight",
+      "limit_kg": 66.7,
+      "nickname": "All-Rounders",
+      "description": "The heart of the Federation \u2014 strong, agile, and adaptable. Every match here feels like a main event."
+    },
+    "middleweight": {
+      "name": "Middleweight",
+      "limit_kg": 72.6,
+      "nickname": "Precision Powerhouses",
+      "description": "Calculated aggression and perfect form. These are the tacticians \u2014 they hit hard but never lose control."
+    },
+    "heavyweight": {
+      "name": "Heavyweight",
+      "limit_kg": 90.7,
+      "nickname": "Titans of the Canvas",
+      "description": "When these giants swing, the air itself flinches. Every punch is a sermon \u2014 every knockout, a revelation."
+    }
+  }
+}

@@ -53,10 +53,7 @@ def _find_cheer_clip() -> Optional[str]:
         try_candidates.append(os.path.join(COMMENTARY_DIR, "cheer.wav"))
 
     # Soft fallback to graphics/promo/music if you use that layout
-    promo_roots = [
-        os.path.join(os.getcwd(), "graphics", "promo", "music"),
-        os.path.join(os.getcwd(), "graphics", "promo")
-    ]
+    promo_roots = [str(PROMO_MUSIC_DIR), str(PROMO_DIR)]
     for root in promo_roots:
         try_candidates.append(os.path.join(root, "cheer.mp3"))
         try_candidates.append(os.path.join(root, "cheer.wav"))
@@ -81,14 +78,14 @@ def mod_spd(speed: int) -> int: return speed // 10
 def mod_def(defense: int) -> int: return defense // 5
 def mod_ftw(footwork: int) -> int: return footwork // 10
 
-def pick_hit_type(margin: int, nat20: bool) -> str:
+def pick_hit_type(margin: int, nat20: bool, rng: random.Random) -> str:
     if nat20: return "uppercut"
-    if margin <= 2: return random.choices(["glancing","jab"], [3,2])[0]
-    elif margin <= 5: return random.choices(["jab","cross","hook"], [2,3,3])[0]
-    else: return random.choices(["cross","hook","uppercut"], [3,3,2])[0]
+    if margin <= 2: return rng.choices(["glancing","jab"], [3,2])[0]
+    elif margin <= 5: return rng.choices(["jab","cross","hook"], [2,3,3])[0]
+    else: return rng.choices(["cross","hook","uppercut"], [3,3,2])[0]
 
-def pick_location() -> str:
-    return random.choices(LOCATIONS, weights=[50,35,12,3])[0]
+def pick_location(rng: random.Random) -> str:
+    return rng.choices(LOCATIONS, weights=[50,35,12,3])[0]
 
 def base_damage_for(hit_type: str) -> Tuple[int,int]:
     for name, lo, hi in HIT_TYPES:
@@ -338,9 +335,8 @@ async def maybe_post_reaction_and_audio(
             try:
                 vc = await ensure_voice(interaction)
                 if vc:
-                    if vc.is_playing(): vc.stop()
-                    # short + snappy
-                    await play_clip(vc, mp3, seconds=5)
+                    # Do not chop off a commentary clip already in progress.
+                    await play_clip(vc, mp3, seconds=None, interrupt=True)
                     await asyncio.sleep(0.05)
             except Exception as e:
                 print(f"[commentary] {type(e).__name__}: {e}")
@@ -368,7 +364,7 @@ async def maybe_post_lull(interaction: discord.Interaction, session: FightSessio
             if murmur:
                 vc = await ensure_voice(interaction)
                 if vc:
-                    await play_clip(vc, murmur, seconds=5)
+                    await play_clip(vc, murmur, seconds=None, interrupt=True)
         except Exception:
             pass
 
@@ -482,45 +478,14 @@ def attack_exchange(attacker: FighterState, defender: FighterState, rng: random.
         decay_special(attacker); decay_special(defender)
         return result
 
-    # First pass to beat DC
+    # Choose a provisional strike before the decisive hit check so traits and
+    # specials can genuinely alter a near hit/miss. The old two-pass gate
+    # returned early and made those bonuses ineffective on marginal rolls.
     roll_total = d20 + atk_mod
     margin = roll_total - def_dc
-    if roll_total < def_dc:
-        result["roll_total"] = roll_total
-        result["atk_mod"] = atk_mod
-        result["def_dc"] = def_dc
-        result["outcome"] = "miss"
-        attacker.exchanges += 1
-        attacker.fatigue += max(1, 3 - attacker.boxer.stamina // 40)
-        decay_special(attacker); decay_special(defender)
-        return result
-
-    # Determine location + low blow check
-    location = pick_location()
-    if location == "low_blow":
-        result["roll_total"] = roll_total
-        result["atk_mod"] = atk_mod
-        result["def_dc"] = def_dc
-        result["outcome"] = "low_blow"
-        result["location"] = "low_blow"
-        attacker.warnings += 1
-        result["notes"].append(f"Ref warning #{attacker.warnings} for low blow!")
-        attacker.off_balance_penalty -= 1
-        if attacker.warnings >= 3:
-            result["notes"].append("Point deducted for repeated fouls!")
-            result["point_deduction"] = True
-        else:
-            result["point_deduction"] = False
-        attacker.exchanges += 1
-        attacker.fatigue += max(1, 3 - attacker.boxer.stamina // 40)
-        decay_special(attacker); decay_special(defender)
-        return result
-
-    # Hit type
     nat20 = (d20 == 20)
-    hit_type = pick_hit_type(margin, nat20)
+    hit_type = pick_hit_type(margin, nat20, rng)
     result["hit_type"] = hit_type
-    result["location"] = location
 
     # Trait adjustments (to-hit/DC)
     ctx_bonus = trait_attack_bonus(attacker.boxer.trait, hit_type)
@@ -553,6 +518,22 @@ def attack_exchange(attacker: FighterState, defender: FighterState, rng: random.
     margin = roll_total - def_dc
     if roll_total < def_dc:
         result["outcome"] = "miss"
+        attacker.exchanges += 1
+        attacker.fatigue += max(1, 3 - attacker.boxer.stamina // 40)
+        decay_special(attacker); decay_special(defender)
+        return result
+
+    # Only a successful attack can stray low.
+    location = pick_location(rng)
+    result["location"] = location
+    if location == "low_blow":
+        result["outcome"] = "low_blow"
+        attacker.warnings += 1
+        result["notes"].append(f"Ref warning #{attacker.warnings} for low blow!")
+        attacker.off_balance_penalty -= 1
+        result["point_deduction"] = attacker.warnings >= 3
+        if result["point_deduction"]:
+            result["notes"].append("Point deducted for repeated fouls!")
         attacker.exchanges += 1
         attacker.fatigue += max(1, 3 - attacker.boxer.stamina // 40)
         decay_special(attacker); decay_special(defender)
@@ -740,7 +721,7 @@ def _highlight_gif_for_event(session: FightSession, ev: dict):
 
     # 1) Try filename convention directly (works even if config maps are empty)
     #    e.g. graphics/promo/rounds/mm_red_hook.gif
-    rounds_dir = Path(os.getcwd()) / "graphics" / "promo" / "rounds"
+    rounds_dir = Path(ROUNDS_DIR)
     fname = f"{mkey.lower()}_{corner.lower()}_{gif_type}.gif"
     fpath = rounds_dir / fname
     if fpath.exists():
@@ -790,7 +771,7 @@ def _finish_gif_for_result(red: Boxer, blue: Boxer, winner_corner: str, win_type
     from pathlib import Path
     import os
     mkey = matchup_key(red, blue)  # e.g., "MM", "FF", "MF"
-    base_dir = Path(os.getcwd()) / "graphics" / "promo" / "finish"
+    base_dir = Path(PROMO_DIR) / "finish"
     file_to_send = None
     url = None
 
@@ -856,6 +837,10 @@ def run_one_round(session: FightSession) -> Tuple[List[dict], Optional[str], Opt
                 session.kd_round["B"] += 1
                 session.kd_total["B"] += 1
                 session.B.off_balance_penalty -= 1
+                kds = session.kd_round["B"] if session.kd_rule == "per_round" else session.kd_total["B"]
+                if session.kd_rule != "off" and kds >= session.kd_limit:
+                    winner_type, loser = "TKO", session.B.boxer.name
+                    break
 
             if session.B.hp <= 0:
                 winner_type, loser = "KO", session.B.boxer.name
@@ -882,6 +867,10 @@ def run_one_round(session: FightSession) -> Tuple[List[dict], Optional[str], Opt
                 session.kd_round["A"] += 1
                 session.kd_total["A"] += 1
                 session.A.off_balance_penalty -= 1
+                kds = session.kd_round["A"] if session.kd_rule == "per_round" else session.kd_total["A"]
+                if session.kd_rule != "off" and kds >= session.kd_limit:
+                    winner_type, loser = "TKO", session.A.boxer.name
+                    break
 
             if session.A.hp <= 0:
                 winner_type, loser = "KO", session.A.boxer.name
@@ -956,40 +945,86 @@ def finalize_if_done(session: FightSession):
 JUDGES = ["TheDude", "Walter Sobchak", "Donny Kerabatsos"]
 
 def _round_stats(events: List[dict], nameA: str, nameB: str) -> tuple[int,int,int,int]:
-    dmgA = sum(e["damage"] for e in events if e.get("outcome")=="hit" and e.get("defender")==nameA)
-    dmgB = sum(e["damage"] for e in events if e.get("outcome")=="hit" and e.get("defender")==nameB)
-    kdA  = sum(1 for e in events if e.get("outcome")=="hit" and e.get("knockdown") and e.get("defender")==nameA)
-    kdB  = sum(1 for e in events if e.get("outcome")=="hit" and e.get("knockdown") and e.get("defender")==nameB)
+    """Return damage dealt and knockdowns scored by A and B in this round.
+
+    The older snapshot counted events by *defender*, which inverted damage/KD
+    ownership and could flip points decisions. Scorecards must count what each
+    boxer did, not what each boxer received.
+    """
+    dmgA = sum(
+        int(e.get("damage", 0))
+        for e in events
+        if e.get("outcome") == "hit"
+        and e.get("attacker") == nameA
+        and e.get("defender") == nameB
+    )
+    dmgB = sum(
+        int(e.get("damage", 0))
+        for e in events
+        if e.get("outcome") == "hit"
+        and e.get("attacker") == nameB
+        and e.get("defender") == nameA
+    )
+    kdA = sum(
+        1
+        for e in events
+        if e.get("outcome") == "hit"
+        and e.get("knockdown")
+        and e.get("attacker") == nameA
+        and e.get("defender") == nameB
+    )
+    kdB = sum(
+        1
+        for e in events
+        if e.get("outcome") == "hit"
+        and e.get("knockdown")
+        and e.get("attacker") == nameB
+        and e.get("defender") == nameA
+    )
     return dmgA, dmgB, kdA, kdB
 
 def _score_round(dmgA: int, dmgB: int, kdA: int, kdB: int, bias: float, rng: random.Random) -> tuple[int,int,str]:
-    diff = dmgB - dmgA
-    eff = diff - bias
+    # Positive differential means A dealt more damage; negative means B did.
+    # Small judge bias only matters on near-even rounds.
+    diff = dmgA - dmgB
+    # Knockdowns are material scoring events, not merely a post-hoc bonus for
+    # whichever boxer already won the damage comparison.
+    kd_diff = kdA - kdB
+    eff = diff + (kd_diff * 8) + bias
     if abs(eff) < 2:
         winner = "A" if rng.random() + (bias*0.25) > 0.5 else "B"
     else:
-        winner = "A" if eff < 0 else "B"
+        winner = "A" if eff > 0 else "B"
 
     scoreA, scoreB = 10, 10
     if winner == "A":
-        scoreB -= 1
-        if kdB >= 2: scoreB = 7
-        elif kdB == 1: scoreB = 8
+        scoreB = 9
+        net_kd = max(0, kdA - kdB)
+        if net_kd >= 2: scoreB = 7
+        elif net_kd == 1: scoreB = 8
     else:
-        scoreA -= 1
-        if kdA >= 2: scoreA = 7
-        elif kdA == 1: scoreA = 8
+        scoreA = 9
+        net_kd = max(0, kdB - kdA)
+        if net_kd >= 2: scoreA = 7
+        elif net_kd == 1: scoreA = 8
 
-    if winner == "A" and kdB == 0 and (dmgA - dmgB) >= 10 and scoreB == 9:
+    if winner == "A" and kdA == 0 and (dmgA - dmgB) >= 10 and scoreB == 9:
         scoreB = 8
-    if winner == "B" and kdA == 0 and (dmgB - dmgA) >= 10 and scoreA == 9:
+    if winner == "B" and kdB == 0 and (dmgB - dmgA) >= 10 and scoreA == 9:
         scoreA = 8
 
     note = f"{scoreA}-{scoreB} (dmg A/B {dmgA}/{dmgB}, KD A/B {kdA}/{kdB})"
     return scoreA, scoreB, note
 
 def compute_scorecards(session: FightSession) -> list[dict]:
-    rng = session.rng
+    cached = getattr(session, "judge_cards", None)
+    if cached is not None:
+        return cached
+    # Never consume the live fight RNG while judging. Same fight log => same cards.
+    import hashlib, json
+    payload = json.dumps(session.log, sort_keys=True, default=str).encode("utf-8")
+    seed = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") ^ int(getattr(session, "rng_seed", 0) or 0)
+    rng = random.Random(seed)
     nameA, nameB = session.A.boxer.name, session.B.boxer.name
     cards = []
     judge_biases = {JUDGES[0]: +0.15, JUDGES[1]: 0.0, JUDGES[2]: -0.15}
@@ -1002,20 +1037,30 @@ def compute_scorecards(session: FightSession) -> list[dict]:
             dmgA, dmgB, kdA, kdB = _round_stats(r["events"], nameA, nameB)
             sA, sB, note = _score_round(dmgA, dmgB, kdA, kdB, bias, rng)
 
-            # deduct 1 point for each fighter with 3+ low-blow warnings
-            warnsA = session.A.warnings
-            warnsB = session.B.warnings
-            if warnsA >= 3:
-                sA -= 1
-                note += f"  (-1 for fouls by {nameA})"
-            if warnsB >= 3:
-                sB -= 1
-                note += f"  (-1 for fouls by {nameB})"
+            # Apply foul deductions to the round in which they occurred.
+            # attack_exchange marks every low blow from warning #3 onward with
+            # point_deduction=True; the old snapshot incorrectly deducted a
+            # point from *every* scored round once cumulative warnings hit 3.
+            dedA = sum(
+                1 for e in r["events"]
+                if e.get("attacker") == nameA and e.get("point_deduction")
+            )
+            dedB = sum(
+                1 for e in r["events"]
+                if e.get("attacker") == nameB and e.get("point_deduction")
+            )
+            if dedA:
+                sA -= dedA
+                note += f"  (-{dedA} foul point{'s' if dedA != 1 else ''} by {nameA})"
+            if dedB:
+                sB -= dedB
+                note += f"  (-{dedB} foul point{'s' if dedB != 1 else ''} by {nameB})"
             totalA += sA
             totalB += sB
             per_round.append((sA, sB, note))
         verdict = "A" if totalA > totalB else ("B" if totalB > totalA else "Draw")
         cards.append({"judge": j, "totalA": totalA, "totalB": totalB, "rounds": per_round, "for": verdict})
+    session.judge_cards = cards
     return cards
 
 async def send_finish_announcement(
@@ -1158,10 +1203,7 @@ def _find_bell_clip() -> Optional[str]:
             os.path.join(COMMENTARY_DIR, "Bell.wav"),
         ]
 
-    promo_roots = [
-        os.path.join(os.getcwd(), "graphics", "promo", "music"),
-        os.path.join(os.getcwd(), "graphics", "promo"),
-    ]
+    promo_roots = [str(PROMO_MUSIC_DIR), str(PROMO_DIR)]
     for root in promo_roots:
         try_candidates += [
             os.path.join(root, "Bell.mp3"),

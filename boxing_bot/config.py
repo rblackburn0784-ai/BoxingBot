@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import shutil
 
 # ──────────────────────────────
 # Project roots
@@ -139,7 +140,7 @@ FINISH_GIF_URL: Dict[Tuple[str,str,str], str] = {}
 # ──────────────────────────────
 # Audio / ffmpeg
 # ──────────────────────────────
-FFMPEG_PATH = os.getenv("FFMPEG_PATH", r"C:\ffmpeg\bin\ffmpeg.exe")
+FFMPEG_PATH = os.getenv("FFMPEG_PATH") or shutil.which("ffmpeg") or r"C:\ffmpeg\bin\ffmpeg.exe"
 
 # ──────────────────────────────
 # Game settings
@@ -149,8 +150,11 @@ class Settings:
     DB_FILE: str = str(ROOT_DIR / "boxing_db.json")
     MAX_TOTAL_BONUS: int = 5
     MIN_PER_STAT: int = 0
-    MAX_PER_STAT: int = 100
+    MAX_PER_STAT: int = 20
+    BASE_STAT_POINT_CAP: int = 60
     FFMPEG_PATH: str = FFMPEG_PATH
+    MUSIC_DIR: str = str(MUSIC_DIR)
+    FIGHT_STATE_FILE: str = str(ROOT_DIR / "fight_sessions.json")
     EXCHANGES_PER_BOXER: int = 3
 
 SETTINGS = Settings()

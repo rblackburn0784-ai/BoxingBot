@@ -3,7 +3,7 @@ on:
   push:
     branches: [main]
     paths:
-      - '.v202_payload.tar.gz'
+      - '.v202_payload.part*'
 permissions:
   contents: write
 jobs:
@@ -11,8 +11,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Extract V2.0.2 payload
-        run: tar -xzf .v202_payload.tar.gz
+      - name: Rebuild and verify V2.0.2 payload
+        run: |
+          cat .v202_payload.part* | base64 -d > .v202_payload.tar.gz
+          echo '288a7465d0744bba04b5fc4a5db003a504a05f58514557dcd980e74d16541f57  .v202_payload.tar.gz' | sha256sum -c -
+          tar -tzf .v202_payload.tar.gz >/dev/null
+          tar -xzf .v202_payload.tar.gz
       - name: Verify source
         run: |
           python -m compileall -q boxing_bot tests
@@ -27,7 +31,7 @@ jobs:
           print('V2.0.2 verification PASS')
           PY
       - name: Remove promotion payload and workflow
-        run: rm -f .v202_payload.tar.gz .github/workflows/promote-v202.yml
+        run: rm -f .v202_payload.tar.gz .v202_payload.part* .github/workflows/promote-v202.yml
       - name: Commit stable release
         run: |
           git config user.name 'github-actions[bot]'
